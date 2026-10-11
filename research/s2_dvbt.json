@@ -1,0 +1,74 @@
+[
+  {
+    "url": "https://forums.adafruit.com/viewtopic",
+    "name": "RTL-SDR is seen as a keyboard",
+    "snippet": "Mar 20, 2018 — I had to download and install the Zadig V2.3 to be able to install the WinUSB driver for Bulk In, Interface 0 successfully. I believe that the ... Read more",
+    "host_name": "forums.adafruit.com",
+    "rank": 0,
+    "date": "Mar 20, 2018",
+    "favicon": ""
+  },
+  {
+    "url": "https://forums.hak5.org/topic",
+    "name": "RTL SDR Not Working in Win 7",
+    "snippet": "Mar 20, 2016 — I downloaded all the Software and details from Zadig, SD#, HDSDR, and SD-RADIO sites, sifted through numerous links on this topic to no avail. Read more",
+    "host_name": "forums.hak5.org",
+    "rank": 1,
+    "date": "Mar 20, 2016",
+    "favicon": ""
+  },
+  {
+    "url": "https://forums.gentoo.org",
+    "name": "rtl-sdr and udev problems",
+    "snippet": "Jun 4, 2025 — This problem concerns installing and running net-wireless/ rtl - sdr for a software-defined radrio based upon the Realtek Semiconductor Corp. Read more",
+    "host_name": "forums.gentoo.org",
+    "rank": 2,
+    "date": "Jun 4, 2025",
+    "favicon": ""
+  },
+  {
+    "url": "https://forum.openmarine.net/showthread",
+    "name": "Add Realtek RTL2832U USB to receive AIS data",
+    "snippet": "May 20, 2021 — I just installed the OS and want to receive AIS data with a Realtek RTL2832U USB device. It SDR capable, DVB : registering new adapter ( DVB - T ))... ...",
+    "host_name": "forum.openmarine.net",
+    "rank": 3,
+    "date": "May 20, 2021",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/DSheirer/sdrtrunk/issues",
+    "name": "Unable to see tuner RTL2832U · Issue #403 · DSheirer/",
+    "snippet": "Sep 5, 2018 — I installed a libusb driver and still getting a couple of errors in the startup. I can now see the tuner inside the app. E:\\ SDR >java -jar sdr - ... Read more",
+    "host_name": "github.com",
+    "rank": 4,
+    "date": "Sep 5, 2018",
+    "favicon": ""
+  },
+  {
+    "url": "https://forums.nextpvr.com/archive/thread-57578-2",
+    "name": "Realtek 2832u Driver",
+    "snippet": "The good news is that the latest Windows 10 (Creators) update does not overwrite the driver !! However as the RTL2832U only supports DVB - T it is now less useful ... Read more",
+    "host_name": "forums.nextpvr.com",
+    "rank": 5,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.schripsema.org/SDRsharp_install",
+    "name": "SDR# + RTL2832 driver installatie op Windows 7",
+    "snippet": "Om de DVB - T stick met de E4000 tuner en de RTL2832U chip te kunnen gebruiken als SDR ontvanger op een Windows7 PC, moeten er een aantal zaken geïnstalleerd ... Read more 2 pages",
+    "host_name": "www.schripsema.org",
+    "rank": 6,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://forums.nextpvr.com/showthread",
+    "name": "RTL2832U FM tuner driver?",
+    "snippet": "I now would like to use my DAB tuner stick that has FM on it but need a driver that NPVR can see. The software for the stick has a tuner but not the driver ... Read more",
+    "host_name": "forums.nextpvr.com",
+    "rank": 7,
+    "date": "",
+    "favicon": ""
+  }
+]

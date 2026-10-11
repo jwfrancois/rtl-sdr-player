@@ -1,0 +1,65 @@
+[
+  {
+    "url": "https://pysdr.org/content/rds",
+    "name": "18. End-to-End Example with RDS",
+    "snippet": "We will have to demodulate FM , frequency shift, filter, decimate, resample, synchronize, decode, and parse the bytes. An example IQ file is provided for testing ... Read more",
+    "host_name": "pysdr.org",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://pypi.org/project/pyrtlsdr",
+    "name": "pyrtlsdr",
+    "snippet": "from pylab import * from rtlsdr import * sdr = RtlSdr () # configure device sdr.sample_rate = 2.4e6 sdr.center_freq = 95e6 sdr.gain = 4 samples = sdr. Read more",
+    "host_name": "pypi.org",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://danielggraham.com/sdr-fun-attempt2",
+    "name": "SDR Fun FM- Demodulations - Daniel G. Graham Ph.D",
+    "snippet": "Connect the SDR radio (Complete the steps in the lab to get FM demodulator up and running) Convert to numpy array and visualize. De-emphasis filter … a numpy ...",
+    "host_name": "danielggraham.com",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://pp4fpgas.readthedocs.io/latest/project7",
+    "name": "Project: FM Demodulator — pp4fpgas 0.0.1 documentation",
+    "snippet": "Project: FM Demodulator . 1) Introduction  . The project develops a mono FM receiver that can be used to listen to the radio through your Pynq board. Read more",
+    "host_name": "pp4fpgas.readthedocs.io",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://ajoo-github-blog-old.pages.dev",
+    "name": "Intro to RTL-SDR, Part II - Software",
+    "snippet": "Feb 7, 2017 — As a software defined radio Hello World of sorts I'll go over how to demodulate FM signals using a variety of tools. First using specialized ... Read more",
+    "host_name": "ajoo-github-blog-old.pages.dev",
+    "rank": 4,
+    "date": "Feb 7, 2017",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/nktkt/rtlsdr-am-fm-demod",
+    "name": "nktkt/rtlsdr-am-fm-demod: Software Defined Radio (SDR)",
+    "snippet": "A small, self-contained Python project that receives AM and FM broadcast with an RTL-SDR dongle (RTL2832U + R820T2 / R860) and demodulates IQ samples to ... Read more",
+    "host_name": "github.com",
+    "rank": 5,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://dsp.stackexchange.com/questions",
+    "name": "Real-time FM demod results in clicking and strangely",
+    "snippet": "Jul 10, 2021 — I can hear an audible click every time a new sample block is processed, which is both annoying and a sign that things aren't working quite right ... Read more",
+    "host_name": "dsp.stackexchange.com",
+    "rank": 6,
+    "date": "Jul 10, 2021",
+    "favicon": ""
+  }
+]

@@ -1,0 +1,65 @@
+[
+  {
+    "url": "https://www.rtl-sdr.com/rtl-sdr-quick-start-guide",
+    "name": "Quick Start Guide",
+    "snippet": "SDR++ Setup Guide (Tested on Windows 7, 10, 11) (Works with RTL-SDR Blog V4/V3) · Follow the Zadig guide above to install the RTL-SDR drivers via Zadig. · Head to ... Read more",
+    "host_name": "www.rtl-sdr.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "http://forums.radioreference.com/threads",
+    "name": "RTL-SDR Windows 11",
+    "snippet": "Feb 15, 2022 — Zadig - USB driver installation made easy ... You need to download the Zadig software to install the correct drivers correctly for your SDR sticks ... Read more",
+    "host_name": "forums.radioreference.com",
+    "rank": 1,
+    "date": "Feb 15, 2022",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.rtl-sdr.com",
+    "name": "Getting the RTL-SDR to work in Windows 10",
+    "snippet": "Aug 6, 2015 — Make sure that WinUSB is selected as the target driver and click on Replace Driver. If you need more help see the Quickstart Guide. (NOTE: If ... Read more",
+    "host_name": "www.rtl-sdr.com",
+    "rank": 2,
+    "date": "Aug 6, 2015",
+    "favicon": ""
+  },
+  {
+    "url": "https://sdr-radio.groups.io/main/topic",
+    "name": "SETUP : RTL-SDR dongle (RTL2832U) & TS-450",
+    "snippet": "Mar 13, 2019 — 1. Download and install Zadig . · 2. Run Zadig with your dongle(s) plugged in. · 3. Select \"List All Devices\" from the \"Options\" menu. · 4. Click ... Read more",
+    "host_name": "sdr-radio.groups.io",
+    "rank": 3,
+    "date": "Mar 13, 2019",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.facebook.com/fb-answers",
+    "name": "RTL SDR Driver Download Guide",
+    "snippet": "For Windows you'll need Zadig to install the WinUSB driver for your RTL-SDR dongle, while Android apps usually grab the RTL2832U driver from the Play Store. Read more",
+    "host_name": "www.facebook.com",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.sdrstore.eu",
+    "name": "SDRSharp, SDR++, Zadig, Drivers, and First Signal",
+    "snippet": "May 28, 2026 — Install WinUSB with Zadig as normal . Download the latest RTL-SDR Blog driver release. Copy the correct rtlsdr.dll into the SDR software folder. Read more",
+    "host_name": "www.sdrstore.eu",
+    "rank": 5,
+    "date": "May 28, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.rtl-sdr.com/comment-page-2",
+    "name": "Manual Installation of SDR#",
+    "snippet": "This page is purely instructions for a manual install which 99.9% of the time is not necessary! 1) Download the RTL-SDR Drivers , and extract the rtlsdr.dll file ... Read more",
+    "host_name": "www.rtl-sdr.com",
+    "rank": 6,
+    "date": "",
+    "favicon": ""
+  }
+]

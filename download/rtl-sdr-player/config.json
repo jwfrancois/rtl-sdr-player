@@ -1,0 +1,9 @@
+{
+  "port": 8515,
+  "de_emphasis_us": 75,
+  "default_band": "wfm",
+  "default_freq_hz": 98300000,
+  "audio_target_buffer_s": 2.5,
+  "sim_fallback": true,
+  "lo_offset_hz": 250000
+}
