@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Unit + integration tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Byte-compile sanity
+        run: python -m compileall -q backend app.py
+
+      - name: RDS codec verification (IEC 62106)
+        run: python tests/verify_rds.py
+
+      - name: RDS DSP chain (synthetic signal)
+        run: python tests/test_rds_chain.py
+
+      - name: Engine test (demods, squelch, scanner, SSB, memory)
+        run: python tests/test_engine.py
+
+  smoke:
+    name: REST + WebSocket smoke test (sim server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Boot server in sim mode
+        run: |
+          python app.py --port 8531 --sim --no-browser > server.log 2>&1 &
+          for i in $(seq 1 40); do
+            sleep 1
+            if curl -sf http://127.0.0.1:8531/api/status > /dev/null; then
+              echo "server up after ${i}s"
+              break
+            fi
+          done
+          curl -sf http://127.0.0.1:8531/api/status > /dev/null || { cat server.log; exit 1; }
+
+      - name: Run smoke test
+        run: python tests/smoke_test.py
+
+      - name: Dump server log on failure
+        if: failure()
+        run: tail -50 server.log
