@@ -39,25 +39,19 @@ Dongle → [this app] → http://localhost:8515
 > DVB-T TV receiver again you would re-run Zadig and pick the original
 > driver — see the TV section below.)
 
-**3. Get the native DLLs** — the app needs `rtlsdr.dll` and `libusb-1.0.dll`,
-and since v1.3.1 it registers the app folder itself, so placing the files
-there is enough:
+**3. Native DLLs — automatic since v1.3.2** — `setup.bat` installs the
+  `pyrtlsdrlib` package, which **ships the correct 64-bit librtlsdr DLL**
+  (libusb statically linked) and pyrtlsdr picks it up by itself. No manual
+  DLL download, no bitness traps. The app folder also contains a verified
+  `dlls\` fallback (see `dlls\SOURCE.txt`).
 
-- Download: <https://github.com/librtlsdr/librtlsdr/releases> (latest
-  `win32-x64` zip) — or the RTL-SDR Blog driver release
-  (<https://www.rtl-sdr.com/rtl-sdr-blog-v-3-downloads/>) which bundles the DLLs.
-- Copy **both** DLLs into the folder that contains `app.py` (the `dlls\`
-  subfolder works too). They must match your Python's bitness: 64-bit Python
-  (the normal installer) needs the **x64** DLLs — 32-bit files fail with
-  *WinError 193*.
-- Verify with `python check_dlls.py` — it prints your Python's bitness, the
-  DLL architecture, whether Windows can actually load them, and the exact fix
-  when something is off.
-
-> Why "I copied them but it still errors" happened before v1.3.1: Python 3.8+
-> no longer searches an application's own folder when native DLLs are loaded.
-> The app now calls `os.add_dll_directory()` on the app folder at startup, so
-> the DLLs are found where the instructions said to put them.
+  Only if you prefer manual DLLs: download the librtlsdr x64 release
+  (<https://github.com/librtlsdr/librtlsdr/releases>) and copy
+  `librtlsdr.dll` + `libusb-1.0.dll` next to `app.py` — they **must** match
+  your Python's bitness (64-bit Python ⇔ x64 DLLs). "Wrong bitness" errors
+  almost always come from 32-bit files in a package that looked 64-bit —
+  `python check_dlls.py` reads the PE header of each DLL and tells you the
+  *actual* architecture, not what the zip name claims.
 
 **4. Install and run:**
 
@@ -98,6 +92,21 @@ macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 (radio works; TV does not).
 
 ---
+
+## What's new in v1.3.2
+
+- **No more DLL hunting** — `pyrtlsdrlib` (added to `requirements.txt`)
+  ships a prebuilt **64-bit librtlsdr with libusb statically linked**;
+  pyrtlsdr loads it automatically, so `setup.bat` alone gets the dongle
+  ready. Manual `rtlsdr.dll` downloads are no longer needed.
+- **Bundled fallback DLLs** — a verified x64 `librtlsdr.dll` +
+  `libusb-1.0.dll` now ship in the app's `dlls\` subfolder (origin and
+  licenses in `dlls\SOURCE.txt`), searched automatically at startup.
+- **Fact-based bitness diagnostics** — the app reads the PE header of every
+  DLL it finds, so the status bar reports the *actual* architecture
+  ("rtlsdr.dll is 32-bit (x86) but your Python is 64-bit") instead of
+  guessing from the download you thought you made. `check_dlls.py` reports
+  the same, plus `pyrtlsdrlib` status, and names the exact file to delete.
 
 ## What's new in v1.3.1
 
@@ -289,8 +298,8 @@ airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB) and 123.450
 | Symptom | Fix |
 |---|---|
 | `Could not open the RTL2832U` | Zadig WinUSB driver not bound yet (step 2); or SDR#/SDR++ is open and holds the stick — close it |
-| `rtlsdr.dll not found` / DLL warning at the bottom | Copy `rtlsdr.dll` + `libusb-1.0.dll` next to `app.py` (step 3) and run `python check_dlls.py` — it names the exact problem (missing, wrong bitness, broken libusb) |
-| WinError 193 in the status bar | Your DLLs are 32-bit but Python is 64-bit — download the **x64** librtlsdr build and replace both DLLs |
+| `rtlsdr.dll not found` / DLL warning at the bottom | Run `setup.bat` (installs `pyrtlsdrlib` = automatic DLL); or copy the DLLs from the app's `dlls\` subfolder next to `app.py`; `python check_dlls.py` names the exact problem |
+| WinError 193 in the status bar | The DLL file itself is the wrong bitness (the zip name lied). Delete that DLL from the app folder and run `setup.bat` — or replace it with the x64 copy from the app's `dlls\` subfolder |
 | Dongle won't switch on / falls back to simulation | Click **Use dongle** in the header; the status bar then shows the current reason (DLLs, Zadig driver, or stick busy) |
 | Device shows but tuning fails | Another process owns the stick; on Linux unload `dvb_usb_rtl28xxu` |
 | Strong distortion on FM | Lower the gain (dropdown) — signal overload |
@@ -306,7 +315,8 @@ airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB) and 123.450
 
 ```
 app.py               entry point (FastAPI + uvicorn)
-check_dlls.py        Windows DLL diagnostic (bitness, files, load test)
+check_dlls.py        Windows DLL diagnostic (bitness, PE arch, load test)
+dlls/                verified x64 librtlsdr + libusb fallback DLLs (+SOURCE.txt)
 backend/config.py    defaults + band/preset/mode/scan tables
 backend/device.py    RTL-SDR driver layer + synthetic simulator (RDS + SSB test signals)
 backend/dsp.py       FM/AM/NBFM/SSB demodulation, CTCSS decoder, pilot tracker, decimation, PSD

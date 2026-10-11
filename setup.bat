@@ -21,7 +21,8 @@ if errorlevel 1 (
 echo [ok] Python found.
 
 REM --- 2. Dependencies --------------------------------------------------
-echo [*] Installing Python packages (fastapi, uvicorn, numpy, scipy, pyrtlsdr)...
+echo [*] Installing Python packages (fastapi, uvicorn, numpy, scipy,
+echo     pyrtlsdr, pyrtlsdrlib - the last one bundles the native DLL)...
 python -m pip install --quiet --upgrade pip
 python -m pip install --quiet -r requirements.txt
 if errorlevel 1 (

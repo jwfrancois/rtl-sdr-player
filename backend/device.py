@@ -77,7 +77,12 @@ class RtlSdrDevice:
         from rtlsdr import RtlSdr  # deferred import: gives friendly errors upstream
 
         self.index = index
-        self.sdr = RtlSdr(index=index)
+        try:
+            # pyrtlsdr >= 0.5.0 (also accepts serial_number=)
+            self.sdr = RtlSdr(device_index=index)
+        except TypeError:
+            # older pyrtlsdr releases used index=
+            self.sdr = RtlSdr(index=index)
         self._open = True
 
     # -- identity ----------------------------------------------------------
@@ -286,14 +291,34 @@ class SimDevice:
 # --------------------------------------------------------------------------
 # Detection
 # --------------------------------------------------------------------------
+_PE_MACHINE = {0x014C: "32-bit (x86)", 0x8664: "64-bit (x64)",
+               0xAA64: "64-bit (ARM64)"}
+
+
+def _pe_machine(path):
+    """'64-bit (x64)' / '32-bit (x86)' from a DLL's PE header, or None."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(4096)
+        if len(data) < 0x40 or data[:2] != b"MZ":
+            return None
+        pe_off = struct.unpack_from("<I", data, 0x3C)[0]
+        if pe_off + 6 > len(data):
+            return None
+        machine = struct.unpack_from("<H", data, pe_off + 4)[0]
+        return _PE_MACHINE.get(machine, hex(machine))
+    except OSError:
+        return None
+
+
 def windows_dll_report():
     """Diagnose the native librtlsdr situation (Windows only; {} elsewhere).
 
     Reports which Python is running, where pyrtlsdr/rtlsdr.dll/libusb-1.0.dll
-    were found, and — most importantly — whether rtlsdr.dll itself can be
-    loaded by ctypes, with the exact WinError when it cannot. This turns the
-    vague "DLLs were not found" into an actionable answer (wrong bitness,
-    missing libusb, wrong folder, ...).
+    were found, the *actual* PE architecture of each file, whether
+    pyrtlsdrlib (the self-contained prebuilt wheel) is installed, and whether
+    rtlsdr.dll itself can be loaded by ctypes — with the exact WinError when
+    it cannot. This turns "wrong bitness" from a guess into a fact.
     """
     if not IS_WINDOWS:
         return {}
@@ -303,9 +328,13 @@ def windows_dll_report():
         "python_bits": struct.calcsize("P") * 8,
         "python_exe": sys.executable,
         "pyrtlsdr": None,
+        "pyrtlsdrlib": None,
+        "pyrtlsdrlib_dll": None,
         "searched_dirs": list(_DLL_CANDIDATE_DIRS),
         "rtlsdr_dll": None,
+        "rtlsdr_arch": None,
         "libusb_dll": None,
+        "libusb_arch": None,
         "load_ok": False,
         "winerror": None,
         "message": None,
@@ -314,15 +343,16 @@ def windows_dll_report():
     # rtlsdr.dll / libusb-1.0.dll: check our candidate folders + System32
     system32 = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
                             "System32")
-    for name, key in (("rtlsdr.dll", "rtlsdr_dll"),
-                      ("librtlsdr.dll", "rtlsdr_dll"),
-                      ("libusb-1.0.dll", "libusb_dll")):
+    for name, key, arch in (("rtlsdr.dll", "rtlsdr_dll", "rtlsdr_arch"),
+                            ("librtlsdr.dll", "rtlsdr_dll", "rtlsdr_arch"),
+                            ("libusb-1.0.dll", "libusb_dll", "libusb_arch")):
         if rep[key]:
             continue
         for d in _DLL_CANDIDATE_DIRS + (system32,):
             p = os.path.join(d, name)
             if os.path.isfile(p):
                 rep[key] = p
+                rep[arch] = _pe_machine(p)
                 break
 
     try:
@@ -330,6 +360,15 @@ def windows_dll_report():
         rep["pyrtlsdr"] = getattr(_rtl, "__version__", "installed")
     except Exception as exc:  # not installed, or its own load failed
         rep["pyrtlsdr"] = f"not usable ({exc})"
+
+    # pyrtlsdrlib: the prebuilt-dll wheel (self-contained x64 librtlsdr)
+    try:
+        from pyrtlsdrlib.lib import get_library_files
+        files = get_library_files()
+        rep["pyrtlsdrlib"] = "installed"
+        rep["pyrtlsdrlib_dll"] = str(files[0]) if files else None
+    except ImportError:
+        rep["pyrtlsdrlib"] = "not installed"
 
     # Preflight: load rtlsdr.dll by absolute path and capture the real error
     if rep["rtlsdr_dll"]:
@@ -351,30 +390,42 @@ def _import_error_hint():
 
     rep = windows_dll_report()
     bits = rep["python_bits"]
-    folders = _DLL_CANDIDATE_DIRS[0]
-    if len(_DLL_CANDIDATE_DIRS) > 1:
-        folders += f" (or its {os.path.basename(_DLL_CANDIDATE_DIRS[1])}\\ subfolder)"
+    want = "64-bit (x64)" if bits == 64 else "32-bit (x86)"
+    auto_fix = ("run setup.bat (installs the pyrtlsdrlib package with the "
+                "correct prebuilt DLL), or pip install pyrtlsdrlib")
+
+    if rep["pyrtlsdrlib"] == "installed":
+        # its loader runs before any manual search, so a failure here is odd
+        return (
+            f"pyrtlsdrlib is installed but its librtlsdr ({want}) failed to "
+            f"load. Reinstall it: pip install --force-reinstall pyrtlsdrlib"
+        )
 
     if rep["rtlsdr_dll"] is None:
         return (
-            f"pyrtlsdr is installed but rtlsdr.dll was not found. Copy "
-            f"rtlsdr.dll and libusb-1.0.dll into {folders} — they must be "
-            f"{bits}-bit to match your Python (README.md, step 3; run "
-            f"check_dlls.py to verify)."
+            f"pyrtlsdr is installed but rtlsdr.dll was not found. {auto_fix[0].upper()}"
+            f"{auto_fix[1:]} — or copy rtlsdr.dll + libusb-1.0.dll ({want}) "
+            f"into the app folder or its dlls\\ subfolder (README.md, step 3)."
         )
     if rep["winerror"] == 193:
+        arch = rep.get("rtlsdr_arch") or "the wrong bitness"
+        other = ""
+        if rep.get("libusb_arch") and want not in rep["libusb_arch"]:
+            other = (f" libusb-1.0.dll is also {rep['libusb_arch']} — "
+                     f"replace both.")
         return (
-            f"rtlsdr.dll found at {rep['rtlsdr_dll']} but it is the wrong "
-            f"bitness for your {bits}-bit Python (WinError 193). Download the "
-            f"{bits}-bit (x64) librtlsdr build and replace both DLLs "
-            f"(README.md, step 3)."
+            f"{rep['rtlsdr_dll']} is {arch} but your Python is {bits}-bit "
+            f"(WinError 193).{other} Fix: {auto_fix} — or delete the "
+            f"wrong DLL(s) from the app folder; a verified {want} copy "
+            f"ships in the app's dlls\\ subfolder."
         )
     if rep["winerror"] == 126:
         return (
             f"rtlsdr.dll found at {rep['rtlsdr_dll']} but a dependency is "
             f"missing (WinError 126) — usually libusb-1.0.dll is absent or "
-            f"the wrong bitness. Put the {bits}-bit libusb-1.0.dll in the "
-            f"same folder as rtlsdr.dll."
+            f"the wrong bitness. Fix: {auto_fix}, or put the {want} "
+            f"libusb-1.0.dll (from the app's dlls\\ subfolder) next to "
+            f"rtlsdr.dll."
         )
     if rep["load_ok"]:
         return (

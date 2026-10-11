@@ -6,10 +6,11 @@ were not found, or before asking for help:
 
     python check_dlls.py
 
-It answers the three questions that decide whether the dongle can open:
-  1. Is your Python 32- or 64-bit?         (the DLLs must match)
-  2. Are rtlsdr.dll / libusb-1.0.dll present in the app folder (or dlls\)?
-  3. Can Windows actually LOAD rtlsdr.dll? (bitness / dependency check)
+It answers the four questions that decide whether the dongle can open:
+  1. Is your Python 32- or 64-bit?          (the DLLs must match)
+  2. Is pyrtlsdrlib installed?              (ships the correct DLL itself)
+  3. Are rtlsdr.dll / libusb-1.0.dll found, and what bitness are they REALLY?
+  4. Can Windows actually LOAD rtlsdr.dll?  (dependency check)
 
 Exit code 0 = ready for the dongle, 1 = something needs fixing.
 """
@@ -73,9 +74,25 @@ def main():
 
     # 1. Python bitness -------------------------------------------------
     bits = struct.calcsize("P") * 8
+    want = "64-bit (x64)" if bits == 64 else "32-bit (x86)"
     print(f"  Python          : {bits}-bit  ({sys.executable})")
 
-    # 2. pyrtlsdr --------------------------------------------------------
+    # 2. pyrtlsdrlib - the prebuilt-dll wheel -----------------------------
+    ptl = None
+    try:
+        from pyrtlsdrlib.lib import get_library_files
+        files = get_library_files()
+        ptl = str(files[0]) if files else None
+        print(f"  pyrtlsdrlib     : installed -> {ptl}")
+        print("                    (pyrtlsdr loads this automatically;")
+        print("                     the checks below are just fallback info)")
+    except ImportError:
+        print("  pyrtlsdrlib     : not installed")
+        print(f"                    easiest fix:  pip install pyrtlsdrlib")
+        print(f"                    (or just run setup.bat) - it bundles the")
+        print(f"                    {want} librtlsdr DLL, no manual files needed")
+
+    # 3. pyrtlsdr --------------------------------------------------------
     try:
         import rtlsdr as _rtl
         ver = getattr(_rtl, "__version__", "?")
@@ -85,60 +102,68 @@ def main():
         print("                    fix: pip install --force-reinstall pyrtlsdr")
         return 1
 
-    # 3. the two DLL files ------------------------------------------------
+    # 4. the two DLL files (fallback source) ------------------------------
     rtlsdr = find("rtlsdr.dll") or find("librtlsdr.dll")
     libusb = find("libusb-1.0.dll")
     print(f"  rtlsdr.dll      : {rtlsdr or 'NOT FOUND'}")
     print(f"  libusb-1.0.dll  : {libusb or 'NOT FOUND'}")
 
-    if rtlsdr is None or libusb is None:
+    if rtlsdr is not None:
+        mt = dll_machine_type(rtlsdr)
+        print(f"  rtlsdr.dll arch : {mt or 'unknown/corrupt'}")
+        if mt and want not in mt:
+            ok = False
+            print(f"  [X] rtlsdr.dll is {mt} but Python is {bits}-bit.")
+            print(f"      This file is the problem. Delete it from the app")
+            print(f"      folder and {('pyrtlsdrlib will take over' if ptl else 'run pip install pyrtlsdrlib')}.")
+    if libusb is not None:
+        mtu = dll_machine_type(libusb)
+        print(f"  libusb arch     : {mtu or 'unknown/corrupt'}")
+        if mtu and want not in mtu and not ptl:
+            ok = False
+            print(f"  [X] libusb-1.0.dll is {mtu} but Python is {bits}-bit.")
+
+    if rtlsdr is None and not ptl:
         ok = False
         print()
-        print("  [X] Missing DLL(s). Fix:")
-        print("      1. Download the librtlsdr 'win32-x64' release zip:")
+        print("  [X] No rtlsdr.dll/librtlsdr.dll anywhere and pyrtlsdrlib is")
+        print("      not installed. Fix (pick one):")
+        print(f"      1. pip install pyrtlsdrlib        <- easiest")
+        print(f"         (or re-run setup.bat; it does this for you)")
+        print("      2. Copy the DLLs from the app's dlls\\ subfolder to")
+        print(f"         the app folder: {HERE}")
+        print("      3. Manual download (x64!):")
         print("         https://github.com/librtlsdr/librtlsdr/releases")
-        print("         (or the RTL-SDR Blog driver zip, which bundles them)")
-        print("      2. Copy rtlsdr.dll and libusb-1.0.dll into:")
-        print(f"         {HERE}")
-        print("         (the dlls\\ subfolder also works)")
-        if bits == 64:
-            print("      3. They MUST be the 64-bit (x64) DLLs - 32-bit ones")
-            print("         fail with WinError 193.")
-        return 1
-
-    # 4. bitness match -------------------------------------------------
-    mt = dll_machine_type(rtlsdr)
-    print(f"  rtlsdr.dll arch : {mt or 'unknown'}")
-    mtu = dll_machine_type(libusb)
-    print(f"  libusb arch     : {mtu or 'unknown'}")
-    want = "64-bit (x64)" if bits == 64 else "32-bit (x86)"
-    for label, path, kind in (("rtlsdr.dll", rtlsdr, mt),
-                              ("libusb-1.0.dll", libusb, mtu)):
-        if kind and want not in kind:
-            ok = False
-            print(f"  [X] {label} is {kind} but your Python is {bits}-bit.")
-            print(f"      Replace it with the {want} build (WinError 193 cause).")
 
     # 5. can Windows actually load it? -----------------------------------
-    try:
-        ctypes.WinDLL(rtlsdr)
-        print("  Load test       : rtlsdr.dll loads OK")
-    except OSError as exc:
-        ok = False
-        print(f"  Load test       : FAILED (WinError {exc.winerror})")
-        print(f"                    {exc}")
-        if exc.winerror == 126:
-            print("      Usually libusb-1.0.dll missing next to rtlsdr.dll,")
-            print("      or itself the wrong bitness / broken download.")
-        if exc.winerror == 193:
-            print("      Bitness mismatch - see above.")
+    if rtlsdr is not None:
+        try:
+            ctypes.WinDLL(rtlsdr)
+            print("  Load test       : rtlsdr.dll loads OK")
+        except OSError as exc:
+            ok = False
+            print(f"  Load test       : FAILED (WinError {exc.winerror})")
+            print(f"                    {exc}")
+            if exc.winerror == 126 and not ptl:
+                print("      libusb-1.0.dll missing next to it, or wrong")
+                print("      bitness. A correct copy is in the app's dlls\\")
+                print("      subfolder - or just pip install pyrtlsdrlib.")
+            if exc.winerror == 193:
+                print("      Bitness mismatch - see above.")
 
     print("  " + "-" * 46)
     if ok:
-        print("  [ok] DLLs look good. If the app still falls back to the")
-        print("       simulator, the next cause is the USB driver: run")
-        print("       Zadig and bind WinUSB to 'Bulk-In, Interface 0'")
-        print("       (README.md, step 2), then click 'Use dongle'.")
+        if ptl:
+            print("  [ok] Ready: pyrtlsdrlib provides the native librtlsdr.")
+            print("       If the app still falls back to the simulator, the")
+            print("       next cause is the USB driver: run Zadig and bind")
+            print("       WinUSB to 'Bulk-In, Interface 0' (README step 2),")
+            print("       then click 'Use dongle'.")
+        else:
+            print("  [ok] DLLs look good. If the app still falls back to the")
+            print("       simulator, the next cause is the USB driver: run")
+            print("       Zadig and bind WinUSB to 'Bulk-In, Interface 0'")
+            print("       (README.md, step 2), then click 'Use dongle'.")
     else:
         print("  [X] Fix the items marked [X] above, then re-run:")
         print(f"      python {os.path.basename(sys.argv[0])}")
@@ -148,12 +173,13 @@ def main():
 
 def _linux_ok():
     try:
-        ctypes.CDLL("librtlsdr.so")
-        print("  librtlsdr.so loads OK")
+        import rtlsdr  # noqa: F401  (loads via pyrtlsdrlib or system lib)
+        print("  pyrtlsdr + librtlsdr load OK")
         return True
-    except OSError as exc:
-        print(f"  librtlsdr.so failed to load: {exc}")
-        print("  fix: sudo apt install librtlsdr-dev rtl-sdr")
+    except ImportError as exc:
+        print(f"  librtlsdr failed to load: {exc}")
+        print("  fix: pip install pyrtlsdrlib")
+        print("  or:  sudo apt install librtlsdr-dev rtl-sdr")
         return False
 
 

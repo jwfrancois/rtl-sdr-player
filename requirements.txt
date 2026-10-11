@@ -1,12 +1,15 @@
 # RTL-SDR Player — Python dependencies
 # Install with:  pip install -r requirements.txt
 #
-# NOTE: pyrtlsdr needs the native librtlsdr library on your system.
-#       Windows: copy rtlsdr.dll + libusb-1.0.dll next to app.py (README step 2)
-#       Linux:   sudo apt install librtlsdr-dev rtl-sdr   (or your distro equivalent)
+# pyrtlsdrlib ships prebuilt native librtlsdr binaries (including the
+# correct 64-bit Windows DLL with libusb statically linked). pyrtlsdr
+# picks it up automatically, so NO manual DLL download is needed on
+# Windows. The dlls\ folder in the app is the offline fallback.
+# Linux still needs the system package: sudo apt install librtlsdr-dev rtl-sdr
 
 fastapi>=0.110
 uvicorn[standard]>=0.29
 numpy>=1.24
 scipy>=1.10
 pyrtlsdr>=0.2.9
+pyrtlsdrlib>=0.0.6

@@ -1,0 +1,14 @@
+Verified 64-bit (x64) Windows DLLs, bundled so no manual download is needed:
+
+  librtlsdr.dll   from librtlsdr v0.7.0-13-gc79d official x64 release
+                  https://github.com/librtlsdr/librtlsdr/releases/download/v0.7.0/librtlsdr-0.7.0-13-gc79d-x64.zip
+  libusb-1.0.dll  bundled in the same archive (libusb 1.0.x)
+
+Both verified as PE machine 0x8664 (x64). Licenses: librtlsdr is GPL-2.0+,
+libusb is LGPL-2.1; source code at the URLs above.
+
+Normally you do NOT need these files: setup.bat installs the "pyrtlsdrlib"
+package, which ships the correct prebuilt 64-bit librtlsdr automatically.
+This folder is the offline fallback - the app searches dlls\ at startup.
+If you placed a wrong-bitness rtlsdr.dll next to app.py, delete it and let
+this folder (or pyrtlsdrlib) provide the library.
