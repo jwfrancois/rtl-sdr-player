@@ -1,0 +1,56 @@
+[
+  {
+    "url": "https://en.wikipedia.org/wiki/Radio_Data_System",
+    "name": "Radio Data System",
+    "snippet": "Radio Data System ( RDS ) is a communications protocol standard for embedding small amounts of digital information in conventional FM radio broadcasts. Read more",
+    "host_name": "en.wikipedia.org",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.mathworks.com/help/comm/usrpradio",
+    "name": "RDS/RBDS and RadioText Plus (RT+) FM Receiver",
+    "snippet": "Each block contains a 16-bit information word and 10 parity bits. A distinct 10 -bit offset word is modulo-2 added to the parity bits of each block .",
+    "host_name": "www.mathworks.com",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://haddadi.github.io/RDSencoderHaddadi",
+    "name": "RDS Encoder",
+    "snippet": "by H Haddadi · 2003 — In the case of the RDS block , 26 bits means that four 8-bit registers are used for the message data and the 10 -bit polynomial will require two 8-bit registers. Read more 64 pages",
+    "host_name": "haddadi.github.io",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.db-thueringen.de/servlets",
+    "name": "An FM/RDS (Radio Data System) Software Radio",
+    "snippet": "This paper describes a software radio for the reception of FM (frequency modulation) and RDS ( radio data system) signals. 8 pages",
+    "host_name": "www.db-thueringen.de",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.radioworld.com/news-and-business",
+    "name": "Fixes for Common RDS Problems - Radio World",
+    "snippet": "Jun 27, 2013 — Fixes for Common RDS Problems. Monitor your data displays and tweak them when formats change. By Alan Jurison. Published: June 27, 2013. Read more",
+    "host_name": "www.radioworld.com",
+    "rank": 4,
+    "date": "Jun 27, 2013",
+    "favicon": ""
+  },
+  {
+    "url": "https://wiki.gnuradio.org",
+    "name": "CRC Check",
+    "snippet": "Dec 9, 2025 — The CRC Check block receives a PDU containing a CRC at its end, and checks whether the CRC is correct. The PDU is sent over the ok or fail ... Read more",
+    "host_name": "wiki.gnuradio.org",
+    "rank": 5,
+    "date": "Dec 9, 2025",
+    "favicon": ""
+  }
+]

@@ -66,6 +66,27 @@ async def api_gain(body: dict):
     return {"ok": True, "gain_db": gain}
 
 
+@app.post("/api/squelch")
+async def api_squelch(body: dict):
+    db = body.get("db", None)
+    engine.set_squelch(None if db in (None, "off") else float(db))
+    return {"ok": True, "squelch_db": engine.squelch_db}
+
+
+@app.post("/api/scan")
+async def api_scan(body: dict):
+    action = (body.get("action") or "start").lower()
+    if action == "stop":
+        engine.stop_scan()
+        return {"ok": True, "scan": engine.scan_status()}
+    list_name = body.get("list") or "noaa"
+    try:
+        engine.start_scan(list_name, squelch_db=body.get("squelch_db"))
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return {"ok": True, "scan": engine.scan_status()}
+
+
 @app.get("/api/tv/status")
 async def api_tv_status():
     return {"status": tv.status(), "channels": tv.list_channels(),
@@ -135,10 +156,17 @@ async def ws_spectrum(ws: WebSocket):
         while True:
             psd = engine.get_psd()
             if psd:
-                await ws.send_json({"event": "psd",
-                                    "gen": engine.current_gen(),
-                                    "band": engine.band,
-                                    "freq_hz": engine.freq, **psd})
+                await ws.send_json({
+                    "event": "psd",
+                    "gen": engine.current_gen(),
+                    "band": engine.band,
+                    "freq_hz": engine.freq,
+                    "rds": engine.current_rds(),
+                    "scan": engine.scan_status(),
+                    "squelch_db": engine.squelch_db,
+                    "squelch_open": engine.squelch_open,
+                    "chan_db": engine.chan_db,
+                    **psd})
             await asyncio.sleep(0.1)
     except (WebSocketDisconnect, RuntimeError):
         pass

@@ -38,6 +38,8 @@
     <nav class="tabs" id="band-tabs">
       <button data-band="wfm" class="tab active">FM</button>
       <button data-band="am" class="tab">AM</button>
+      <button data-band="wx" class="tab">WX</button>
+      <button data-band="air" class="tab">AIR</button>
       <button data-band="tv" class="tab">TV</button>
     </nav>
 
@@ -53,6 +55,8 @@
         <input id="freq-input" inputmode="decimal" spellcheck="false">
         <button id="freq-go" class="btn btn-accent">Go</button>
       </div>
+
+      <div class="presets" id="presets"></div>
 
       <div class="meter-row">
         <span class="lbl">SIGNAL</span>
@@ -72,6 +76,39 @@
       </div>
 
       <div class="demod-line" id="demod-line">WFM &middot; &mdash;</div>
+
+      <div class="rds" id="rds-panel" hidden>
+        <div class="rds-head">
+          <span class="rds-title">RDS</span>
+          <span class="rds-flags" id="rds-flags"></span>
+        </div>
+        <div class="rds-ps" id="rds-ps">&mdash;</div>
+        <div class="rds-meta" id="rds-meta">searching for RDS&hellip;</div>
+        <div class="rds-rt" id="rds-rt"></div>
+        <div class="rds-af" id="rds-af"></div>
+      </div>
+
+      <div class="scan" id="scan-panel" hidden>
+        <div class="scan-head">
+          <span class="scan-title">SCANNER</span>
+          <span class="scan-state" id="scan-state">idle</span>
+        </div>
+        <div class="scan-row">
+          <select id="scan-list"></select>
+          <button id="scan-btn" class="btn btn-accent scan-btn">Scan</button>
+        </div>
+        <div class="scan-row sq-row">
+          <span class="lbl">SQL</span>
+          <input type="range" id="squelch" min="-60" max="-5" value="-30" step="1">
+          <span class="scan-db" id="squelch-val">-30 dB</span>
+        </div>
+        <div class="scan-row sq-row">
+          <span class="lbl">LVL</span>
+          <div class="meter"><div class="meter-fill chan" id="chan-fill"></div></div>
+          <span class="scan-db" id="chan-val">&mdash;</span>
+        </div>
+        <div class="scan-log" id="scan-log"></div>
+      </div>
     </div>
 
   </aside>

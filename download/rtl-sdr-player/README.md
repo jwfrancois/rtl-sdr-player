@@ -1,17 +1,21 @@
 # RTL-SDR Player
 
 A local web receiver for the **RTL-SDR Blog v3** (RTL2832U + R820T2): play
-over-the-air **radio (FM + AM)** and **DVB-T TV** from your dongle, with a live
-spectrum analyzer and waterfall, right in your browser.
+over-the-air **radio** and **DVB-T TV** from your dongle, with a live spectrum
+analyzer and waterfall, right in your browser. Built and pinned for the **USA**.
 
 ```
 Dongle → [this app] → http://localhost:8515
              │
-             ├── FM band 87.5–108 MHz   wideband FM demod, offset-tuned
-             ├── AM band 530–1700 kHz   direct-sampling (Q) mode (v3 feature)
+             ├── FM band 87.5–108 MHz    wideband FM + RDS/RBDS (US tables)
+             ├── AM band 530–1700 kHz    direct-sampling (Q) mode (v3 feature)
+             ├── WX tab                  NOAA Weather Radio 162.400–162.550
+             │                           (narrowband FM, 7 channel presets)
+             ├── AIR tab                 US airband 118–137 MHz (AM) with a
+             │                           squelch scanner + key-channel presets
              ├── Live spectrum + waterfall with click-to-tune
-             └── TV tab                 DVB-T capability detection + guide
-                                        (Linux: full channel scan & playback)
+             └── TV tab                  DVB-T capability detection + guide
+                                         (Linux: full channel scan & playback)
 ```
 
 ---
@@ -72,13 +76,50 @@ macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 
 ---
 
+## What's new in v1.1 (USA edition)
+
+- **75 µs de-emphasis pinned** — the FM de-emphasis time constant and the
+  RBDS program-type table are set for the US (`"region": "US"` in
+  `config.json`; European listeners would set `50` — but you're in the US,
+  so it's already right).
+- **RDS station names** — on the FM band the app decodes the 57 kHz RDS
+  subcarrier: program service name (big amber readout), PI code, program
+  type (RBDS names), RadioText, alternative frequencies and even the
+  station's clock-time group. It measures your dongle's clock error from the
+  19 kHz pilot tone (the ppm readout is real) and phase-locks the decoder
+  with a Costas loop. Expect a lock a couple of seconds after tuning to a
+  station with RDS.
+- **NOAA Weather Radio presets** — the WX tab tunes 162.400–162.550 MHz with
+  narrowband FM demodulation (5 kHz deviation, voice-band shaping) and all
+  seven WX1–WX7 channels one click away.
+- **Airband scanner** — the AIR tab receives 118–137 MHz AM and adds a
+  scanner: pick *Key US airband channels* (Guard 121.5, CTAF/UNICOM, air-to-air,
+  FSS…), *NOAA weather* or a *full 118–137 MHz sweep* (760 channels, ~6 min).
+  It hops with a channel-power squelch you can tune live (the LVL bar shows
+  the received channel power against your SQL threshold), holds while a
+  transmission is active, releases 2.5 s after the channel goes quiet, and
+  logs every hit with a timestamp.
+
+### How the squelch works
+
+The scanner (and the SQL slider on WX/AIR bands) gates audio on **channel
+power**: the energy inside the 8 kHz-wide channel after filtering, in dB.
+Noise-only channels sit around −50…−35 dB; any real carrier lands well above
+−20 dB. Start at −20 dB and adjust: too high and weak stations never open the
+gate, too low and the scanner parks on noise.
+
 ## Using it
 
 - **Spectrum**: the curve is the live band scan (2.4 MHz window). Peaks are
   stations. Click or drag anywhere to tune; the amber marker shows the tuned
   frequency; the waterfall below shows history.
-- **Tuning**: arrows step by 100 kHz (FM) / 10 kHz (AM); type a frequency and
-  press Enter. FM shows MHz, AM shows kHz.
+- **Tuning**: arrows step by band (100 kHz FM / 10 kHz AM / 25 kHz WX+AIR);
+  type a frequency and press Enter. FM shows MHz, AM shows kHz.
+- **Presets**: WX and AIR tabs show clickable channel chips (WX1–WX7, Guard,
+  CTAF…). The active one is highlighted.
+- **RDS panel** (FM tab): appears under the demod info line. PS name lights
+  up first (it completes after all four 2-character segments arrive),
+  RadioText and AF list follow. STEREO = 19 kHz pilot detected.
 - **Gain**: leave on Auto first. If FM stations distort, pick a fixed gain
   from the dropdown (e.g. 20–30 dB). In noisy environments lower gain often
   *improves* reception by avoiding ADC overload.
@@ -94,6 +135,8 @@ macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 - Put the dongle near a window for best results.
 - AM (0.5–1.7 MHz) needs a long wire antenna; the stock whip is nearly deaf on
   AM indoors. Even 3–5 m of wire into the antenna input makes a big difference.
+- NOAA WX and airband work fine on the stock whip — they're strong VHF
+  services.
 
 ## TV (DVB-T) — read this
 
@@ -113,20 +156,32 @@ and streams the selected channel through ffmpeg to the built-in video player.
 Tools needed: `sudo apt install dvb-tools ffmpeg`. Switch back to radio with
 `sudo modprobe -r dvb_usb_rtl28xxu`.
 
-North American alternative: the same hardware is superb at **NOAA weather
-radio** (162.400–162.550 MHz), airband, and ADS-B aircraft tracking — easy
-follow-up projects with this app's DSP core.
+North American reality check: with ATSC off the table, this dongle's best
+OTA tricks are exactly what v1.1 ships — NOAA weather radio, airband
+scanning, and RDS-decoding FM.
+
+## Simulation mode
+
+With no dongle present the app runs a synthetic RF spectrum so you can try
+everything: six FM stations (the one at **96.1 MHz carries a full RDS +
+stereo-pilot test signal** — PI `2A5B`, PS `SIM-RDS`), four AM stations,
+airband AM on 121.5/122.8/123.1, and NOAA voice on 162.400/162.550. Start it
+explicitly with `python app.py --sim`.
 
 ## Configuration (`config.json`)
 
 | Key | Default | Meaning |
 |---|---|---|
 | `port` | 8515 | Web server port |
-| `de_emphasis_us` | 75 | FM de-emphasis (75 = Americas/Korea, 50 = most of Europe/Asia) |
+| `region` | "US" | Pins RBDS PTY names (USA program-type table) |
+| `de_emphasis_us` | 75 | FM de-emphasis (75 = Americas/Korea, 50 = EU/Asia) |
 | `default_band` / `default_freq_hz` | wfm / 98.3 MHz | Startup tuning |
 | `audio_target_buffer_s` | 2.5 | Client jitter-buffer target |
 | `sim_fallback` | true | Run a synthetic demo when no dongle is present |
 | `lo_offset_hz` | 250000 | Offset tuning that dodges the RTL-SDR's center DC spike |
+| `squelch_default_db` | -20 | Channel-power squelch threshold used by the scanner |
+| `scan_dwell_s` | 0.45 | Seconds spent per channel while hopping |
+| `scan_release_s` | 2.5 | Squelch-closed time before leaving a held channel |
 
 ## Troubleshooting
 
@@ -136,6 +191,10 @@ follow-up projects with this app's DSP core.
 | `rtlsdr.dll not found` / pyrtlsdr import error | Copy `rtlsdr.dll` + `libusb-1.0.dll` next to `app.py` (step 3) |
 | Device shows but tuning fails | Another process owns the stick; on Linux unload `dvb_usb_rtl28xxu` |
 | Strong distortion on FM | Lower the gain (dropdown) — signal overload |
+| No RDS on a known-RDS station | Check the STEREO flag: without the 19 kHz pilot there is no RDS; try a fixed gain or reposition the antenna |
+| RDS takes a few seconds | Normal — PS needs all four 2-char segments; the decoder first locks carrier + bit timing |
+| Scanner never opens squelch | Raise the LVL bar reading above your SQL value by lowering SQL; check the antenna |
+| Scanner parks on noise | Raise SQL (more positive dB) |
 | No audio at all | Check the browser tab's autoplay block — click anywhere once, then reload |
 | Everything noisy / ghost stations | Keep away from USB 3 ports and use a rear USB 2.0 port |
 | Heard a single tone on every frequency | You are in simulation mode (no dongle detected) — the app says so in the header |
@@ -144,12 +203,13 @@ follow-up projects with this app's DSP core.
 
 ```
 app.py               entry point (FastAPI + uvicorn)
-backend/config.py    defaults + band tables
-backend/device.py    RTL-SDR driver layer + synthetic simulator
-backend/dsp.py       FM/AM demodulation, decimation, PSD
-backend/stream.py    capture thread, tuning, websocket streaming
+backend/config.py    defaults + band/preset/scan tables
+backend/device.py    RTL-SDR driver layer + synthetic simulator (RDS test signal)
+backend/dsp.py       FM/AM/NBFM demodulation, pilot tracker, decimation, PSD
+backend/rds.py       RDS decoder (Costas+Gardner+CRC) + test-signal encoder
+backend/stream.py    capture thread, tuning, squelch, scanner, websocket streaming
 backend/tv.py        DVB-T detection, channel scan, TS streaming (Linux)
-web/                 browser UI (spectrum, waterfall, players)
+web/                 browser UI (spectrum, waterfall, RDS + scanner panels)
 config.json          user settings
 setup.bat / run.bat  Windows helpers
 run.sh               Linux/macOS launcher

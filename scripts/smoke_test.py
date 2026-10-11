@@ -1,107 +1,185 @@
-#!/usr/bin/env python3
-"""End-to-end smoke test for the RTL-SDR Player server (sim mode)."""
+"""Full smoke test for RTL-SDR Player v1.1 (server + REST + websockets).
+
+Boots the app in sim mode on a test port and verifies:
+  1. status: v1.1, US region, new bands + scan lists
+  2. RDS over the spectrum websocket (PI/PS/PTY/AF/RT) on the sim station
+  3. audio websocket still streams PCM (RMS audible)
+  4. squelch REST: opens on WX channel, closes on empty one
+  5. scanner REST: NOAA list holds on an active channel and logs it
+  6. airband tune + scanner on key channels
+"""
 import asyncio
 import json
-import struct
+import sys
+import time
 import urllib.request
 
-BASE = "http://localhost:3000"
+import websockets
+
+BASE = "http://127.0.0.1:8531"
+WS = "ws://127.0.0.1:8531"
 
 
-def post(path, body):
+def rest(path, body=None):
+    if body is None:
+        with urllib.request.urlopen(BASE + path, timeout=5) as r:
+            return json.loads(r.read())
     req = urllib.request.Request(
         BASE + path, data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=10) as r:
+    with urllib.request.urlopen(req, timeout=5) as r:
         return json.loads(r.read())
 
 
-def get(path):
-    with urllib.request.urlopen(BASE + path, timeout=10) as r:
-        return json.loads(r.read())
+async def collect_spectrum(seconds, out):
+    async with websockets.connect(WS + "/ws/spectrum") as ws:
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            out.append(json.loads(await ws.recv()))
 
 
-async def ws_test():
-    import websockets
-
-    async with websockets.connect("ws://localhost:3000/ws/spectrum") as ws:
-        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-        assert msg["event"] == "psd", msg.get("event")
-        n = len(msg["psd_db"])
-        peak = max(msg["psd_db"])
-        floor = msg["floor_db"]
-        print(f"  spectrum: {n} bins, peak {peak:.1f} dB, floor {floor:.1f} dB, "
-              f"sig {msg['sig_db']:.1f} dB  -> {'OK' if n == 512 and peak > floor else 'FAIL'}")
-
-    audio_bytes = 0
-    chunks = 0
-    async with websockets.connect("ws://localhost:3000/ws/audio") as ws:
-        hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-        assert hello["event"] == "hello"
-        print(f"  audio hello: mode={hello['mode']} rate={hello['audio_rate']} "
-              f"target={hello['target_ms']}ms")
-        deadline = asyncio.get_event_loop().time() + 2.0
-        while asyncio.get_event_loop().time() < deadline:
-            data = await asyncio.wait_for(ws.recv(), timeout=2)
-            if isinstance(data, (bytes, bytearray)):
-                audio_bytes += len(data)
-                chunks += 1
-        print(f"  audio: {chunks} binary chunks, {audio_bytes} bytes "
-              f"({audio_bytes/2/48000:.2f} s of PCM) in 2 s -> "
-              f"{'OK' if audio_bytes > 96000 else 'FAIL'}")
-
-    # validate PCM is non-silent: parse last chunk's RMS
-    return audio_bytes
+async def collect_audio(seconds, out):
+    async with websockets.connect(WS + "/ws/audio") as ws:
+        await ws.recv()  # hello
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+            if isinstance(msg, bytes):
+                out.append(msg)
 
 
-async def pcm_level():
-    import websockets
-    import array
-    async with websockets.connect("ws://localhost:3000/ws/audio") as ws:
-        await asyncio.wait_for(ws.recv(), timeout=5)  # hello
-        # discard first (filter transient), then sample a chunk
-        for _ in range(3):
-            data = await asyncio.wait_for(ws.recv(), timeout=2)
-        if isinstance(data, str):
-            data = await asyncio.wait_for(ws.recv(), timeout=2)
-        i16 = array.array("h")
-        i16.frombytes(data)
-        rms = (sum(x * x for x in i16) / len(i16)) ** 0.5
-        print(f"  PCM RMS level: {rms:.0f} (of 32767) -> "
-              f"{'OK (audible)' if rms > 300 else 'FAIL (near silence)'}")
+def rms_of(chunks):
+    import numpy as np
+    if not chunks:
+        return -99.0
+    buf = b"".join(chunks)
+    i16 = np.frombuffer(buf, dtype=np.int16).astype(np.float64)
+    r = float(np.sqrt(np.mean(i16 ** 2))) / 32768.0
+    return 20.0 * np.log10(r + 1e-9)
 
 
 async def main():
-    print("REST:")
-    st = get("/api/status")
-    print(f"  status: mode={st['mode']} device={st['device']!r} tv.available={st['tv']['available']}")
-    assert st["mode"] == "sim"
+    fails = []
 
-    r = post("/api/tune", {"band": "am", "freq_hz": 820000})
-    print(f"  tune AM 820k: {r}")
-    assert r["ok"] and r["freq_hz"] == 820000
-    await asyncio.sleep(0.5)
+    def check(name, ok, extra=""):
+        print(("  PASS  " if ok else "  FAIL  ") + name + ("  " + extra if extra else ""))
+        if not ok:
+            fails.append(name)
 
-    r = post("/api/tune", {"band": "wfm", "freq_hz": 96100000})
-    print(f"  tune FM 96.1M: {r}")
-    assert r["ok"]
+    # ---- 1. status ----
+    st = rest("/api/status")
+    check("status version 1.1.0", st["version"] == "1.1.0", st["version"])
+    check("region US", st.get("region") == "US")
+    check("de-emphasis 75 us", st.get("de_emphasis_us") == 75)
+    check("bands wx+air present", "wx" in st["bands"] and "air" in st["bands"])
+    check("scan lists", set(st["scan_lists"]) == {"noaa", "air_key", "air_band"})
+    check("wx presets", len(st["bands"]["wx"]["presets"]) == 7)
 
-    clamped = post("/api/tune", {"band": "wfm", "freq_hz": 50000000})
-    print(f"  out-of-band clamp: {clamped['freq_hz']} (expect 87500000)")
-    assert clamped["freq_hz"] == 87500000
+    # ---- 2. RDS on 96.1 ----
+    rest("/api/tune", {"band": "wfm", "freq_hz": 96_100_000})
+    frames = []
+    await collect_spectrum(11, frames)
+    rds = [f.get("rds") for f in frames if f.get("rds")]
+    last = rds[-1] if rds else {}
+    print("   rds:", {k: last.get(k) for k in
+                     ("pi", "ps", "pty", "af_mhz", "groups", "pilot")})
+    check("rds pilot detected", bool(last.get("pilot")))
+    check("rds pi 2A5B", last.get("pi") == "2A5B", str(last.get("pi")))
+    check("rds ps SIM-RDS", last.get("ps") == "SIM-RDS", str(last.get("ps")))
+    check("rds pty Top 40", last.get("pty") == "Top 40", str(last.get("pty")))
+    check("rds af decoded", 96.2 in (last.get("af_mhz") or []),
+          str(last.get("af_mhz")))
+    check("rds radiotext", bool(last.get("radiotext")),
+          str(last.get("radiotext"))[:40])
 
-    r = post("/api/gain", {"gain_db": 24.4})
-    print(f"  gain set: {r}")
+    # ---- 3. audio stream ----
+    chunks = []
+    await collect_audio(2.0, chunks)
+    rms = rms_of(chunks)
+    check("audio rms audible", rms > -40, f"{rms:.1f} dBFS, {len(chunks)} chunks")
 
-    # static UI
-    html = urllib.request.urlopen(BASE + "/", timeout=5).read().decode()
-    assert "RTL-SDR Player" in html and "spectrum" in html
-    print(f"  static UI: index.html served ({len(html)} bytes) OK")
+    # ---- 4. squelch ----
+    rest("/api/tune", {"band": "wx", "freq_hz": 162_550_000})
+    rest("/api/squelch", {"db": -20})
+    await asyncio.sleep(1.5)
+    st = rest("/api/status")
+    check("squelch open on WX channel", st["squelch_open"] is True,
+          f"chan {st['chan_db']}")
+    rest("/api/tune", {"band": "wx", "freq_hz": 162_475_000})
+    await asyncio.sleep(1.5)
+    st = rest("/api/status")
+    check("squelch closed on empty channel", st["squelch_open"] is False,
+          f"chan {st['chan_db']}")
+    # muted audio is silence
+    chunks = []
+    await collect_audio(1.0, chunks)
+    rms = rms_of(chunks)
+    check("muted audio is silence", rms < -55, f"{rms:.1f} dBFS")
 
-    print("WEBSOCKETS:")
-    await ws_test()
-    await pcm_level()
-    print("ALL TESTS PASSED")
+    # ---- 5. scanner NOAA ----
+    rest("/api/tune", {"band": "wx", "freq_hz": 162_500_000})
+    rest("/api/squelch", {"db": -20})
+    rest("/api/scan", {"action": "start", "list": "noaa", "squelch_db": -20})
+    found = None
+    t0 = time.time()
+    while time.time() - t0 < 30:
+        sc = rest("/api/status")["scan"]
+        if sc.get("last_active_hz"):
+            found = sc
+            break
+        await asyncio.sleep(0.5)
+    check("scanner found NOAA activity", bool(found),
+          str({k: found.get(k) for k in ("state", "freq_hz", "last_active_hz")}
+              if found else ""))
+    if found:
+        check("scanner holds on WX channel",
+              found["last_active_hz"] in (162_400_000, 162_550_000),
+              str(found["last_active_hz"]))
+        check("scanner log has timestamped hit", bool(found["log"]))
+    rest("/api/scan", {"action": "stop"})
+    sc = rest("/api/status")["scan"]
+    check("scanner stops", sc["running"] is False)
+
+    # manual tune must stop the scanner
+    rest("/api/scan", {"action": "start", "list": "noaa"})
+    rest("/api/tune", {"band": "wfm", "freq_hz": 99_900_000})
+    sc = rest("/api/status")["scan"]
+    check("manual tune stops scanner", sc["running"] is False)
+
+    # ---- 6. airband ----
+    rest("/api/squelch", {"db": None})
+    rest("/api/tune", {"band": "air", "freq_hz": 121_500_000})
+    await asyncio.sleep(1.2)
+    st = rest("/api/status")
+    check("airband 121.5 opens squelch", st["chan_db"] > -20,
+          f"chan {st['chan_db']}")
+    chunks = []
+    await collect_audio(1.5, chunks)
+    rms = rms_of(chunks)
+    check("airband audio audible", rms > -40, f"{rms:.1f} dBFS")
+
+    rest("/api/scan", {"action": "start", "list": "air_key", "squelch_db": -20})
+    found = None
+    t0 = time.time()
+    while time.time() - t0 < 25:
+        sc = rest("/api/status")["scan"]
+        if sc.get("last_active_hz"):
+            found = sc
+            break
+        await asyncio.sleep(0.4)
+    rest("/api/scan", {"action": "stop"})
+    check("airband scanner finds activity",
+          bool(found) and found["last_active_hz"] in
+          (121_500_000, 122_800_000, 123_100_000),
+          str(found and found["last_active_hz"]))
+
+    print()
+    if fails:
+        print("SMOKE TEST FAILURES:", fails)
+        return 1
+    print("SMOKE TEST: ALL PASS")
+    return 0
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

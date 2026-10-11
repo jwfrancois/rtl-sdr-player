@@ -1,0 +1,56 @@
+[
+  {
+    "url": "https://apps.apple.com",
+    "name": "‎Text App - App Store - Apple",
+    "snippet": "Take control of your calls with the new Block Contacts feature. Say goodbye to unwanted calls and enjoy a more peaceful communication experience.",
+    "host_name": "apps.apple.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://play.google.com/store/apps/details?id=meet.chat.messages&hl=en_US",
+    "name": "Messages: Text SMS - Apps on Google Play",
+    "snippet": "Text Messaging App allows you to send messages, plan texts for later, and block unwanted messages for a cleaner inbox.",
+    "host_name": "play.google.com",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://hackage.haskell.org",
+    "name": "text: An efficient packed Unicode text type.",
+    "snippet": "Jan 28, 2026 — The Text type represents Unicode character strings, in a time and space-efficient manner. This package provides text processing capabilities",
+    "host_name": "hackage.haskell.org",
+    "rank": 2,
+    "date": "Jan 28, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.elastic.co",
+    "name": "Text field type | Elasticsearch Reference",
+    "snippet": "A field to index full- text values, such as the body of an email or the description of a product. These fields are analyzed, that is they are passed through.",
+    "host_name": "www.elastic.co",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://schema.org",
+    "name": "Text - Schema.org Data Type",
+    "snippet": "An address extension such as an apartment number, C/O or alternative name . ... The official name of the organization, e.g. the registered company name . Read more",
+    "host_name": "schema.org",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.cms.int",
+    "name": "Convention Text",
+    "snippet": "\"Conservation status of a migratory species\" 1. The object conservation and management of the migratory species concerned which serve to achieve that object.",
+    "host_name": "www.cms.int",
+    "rank": 5,
+    "date": "",
+    "favicon": ""
+  }
+]

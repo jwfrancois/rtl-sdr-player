@@ -7,20 +7,37 @@ Signal path (FM broadcast):
     IQ @ 2.4 MSPS -> NCO shift (station to DC) -> decimate x10 -> 240 kSPS
     -> polar discriminator -> audio LPF + decimate x5 -> 48 kHz
     -> de-emphasis IIR -> int16 mono
+    (a tap of the discriminator output also feeds the 19 kHz pilot tracker
+     and the 57 kHz RDS decoder - see backend/rds.py)
+
+Signal path (NOAA weather / narrowband FM):
+    IQ @ 2.4 MSPS -> NCO shift (offset tuned) -> decimate x10 -> 240 kSPS
+    -> polar discriminator (5 kHz deviation) -> 8 kHz channel LPF
+    -> 3.4 kHz audio LPF + 300 Hz high-pass + AGC -> int16 mono
 
 Signal path (AM broadcast, direct sampling):
     IQ @ 2.4 MSPS -> NCO shift -> decimate x10 -> 240 kSPS -> decimate x5
     (sharp 7.5 kHz channel filter) -> 48 kSPS -> envelope detect
     -> DC blocker + AGC -> int16 mono
+
+Signal path (US airband 118-137 MHz, AM):
+    IQ @ 2.4 MSPS -> offset-tuned like FM -> envelope detect after mixing
+    the station back to DC -> DC blocker + AGC -> int16 mono
 """
 import numpy as np
 from scipy import signal
 
+from . import rds as rds_mod
+
 AUDIO_RATE = 48_000
-BLOCK = 262_144  # capture block (~109 ms at 2.4 MSPS)
+# capture block ~109 ms; must stay divisible by the 10x5 decimation chain so
+# the decimated sample grid stays uniform (keeps the pilot ppm estimator honest)
+BLOCK = 262_140
 
 # FM deviations used to normalize demodulated audio to +/-1.0 full scale
 WFM_DEV_HZ = 75_000
+NBFM_DEV_HZ = 5_000
+PILOT_HZ = 19_000
 
 
 # --------------------------------------------------------------------------
@@ -68,7 +85,12 @@ class Decimator:
 
 
 class DeEmphasis:
-    """Single-pole FM de-emphasis (75 us Americas/Korea, 50 us most others)."""
+    """Single-pole FM de-emphasis.
+
+    The time constant is pinned to 75 microseconds for the USA (Americas and
+    Korea broadcast with 75 us; most of Europe/Asia uses 50 us). It stays
+    configurable in config.json for listeners outside the US.
+    """
 
     def __init__(self, tau_us, fs=AUDIO_RATE):
         alpha = np.exp(-1.0 / (fs * tau_us * 1e-6))
@@ -84,21 +106,68 @@ class DeEmphasis:
         self.zi[:] = 0
 
 
+class PilotWatch:
+    """Tracks the 19 kHz stereo pilot tone in the discriminator output.
+
+    Gives the UI a stereo/pilot indicator and, more importantly, measures the
+    tuner's frequency error: the pilot's offset from exactly 19 kHz equals
+    the ppm error of the dongle clock, which the RDS decoder uses to place
+    its 57 kHz mixing NCO on the true subcarrier frequency.
+    """
+
+    def __init__(self, fs=240_000.0):
+        self.fs = float(fs)
+        self._n0 = 0
+        self._prev_phase = None
+        self._freq_off = 0.0
+        self.present = False
+        self.rel_db = -99.0
+
+    def process(self, d):
+        """d: real discriminator output (rad/sample) for one block."""
+        d = np.asarray(d, dtype=np.float64)
+        n = len(d)
+        w = np.exp(-2j * np.pi * PILOT_HZ
+                   * (self._n0 + np.arange(n)) / self.fs)
+        self._n0 += n
+        g = np.dot(d, w)
+        power = (abs(g) ** 2) * 4.0 / (n * n)
+        sig = float(np.mean(d ** 2)) + 1e-12
+        self.rel_db = 10.0 * np.log10(power / sig)
+        self.present = self.rel_db > -25.0
+        ph = float(np.angle(g))
+        if self._prev_phase is not None and self.present:
+            dd = (ph - self._prev_phase + np.pi) % (2.0 * np.pi) - np.pi
+            df = dd / (2.0 * np.pi * n / self.fs)
+            if abs(df) < 50.0:
+                self._freq_off = 0.8 * self._freq_off + 0.2 * df
+        self._prev_phase = ph
+
+    @property
+    def ppm(self):
+        return self._freq_off / PILOT_HZ * 1e6
+
+
 # --------------------------------------------------------------------------
 # Demodulators
 # --------------------------------------------------------------------------
 class WfmDemod:
-    """Wideband FM broadcast demodulator (mono output)."""
+    """Wideband FM broadcast demodulator (mono output + RDS tap)."""
 
     IF_RATE = 240_000
 
     def __init__(self, fs, lo_offset_hz, de_emphasis_us):
         self.fs = float(fs)
         self.lo_offset = float(lo_offset_hz)
-        self.nco = NcoMixer(-self.lo_offset, self.fs)  # station sits at +offset
+        # NcoMixer(f) shifts the spectrum DOWN by f Hz: the device tunes
+        # below the station, so +offset brings it to exact DC
+        self.nco = NcoMixer(self.lo_offset, self.fs)
         self.dec1 = Decimator(10, 120_000, self.fs, numtaps=129)   # -> 240 kSPS
         self.dec2 = Decimator(5, 15_500, self.IF_RATE, numtaps=129)  # -> 48 kHz
         self.deemph = DeEmphasis(de_emphasis_us)
+        self.pilot = PilotWatch(self.IF_RATE)
+        self.rds = rds_mod.RdsDecoder(self.IF_RATE)
+        self.last_chan_db = None
         self._last = np.complex64(0)
 
     def process(self, raw):
@@ -108,41 +177,119 @@ class WfmDemod:
         z = np.concatenate(([self._last], x))
         self._last = x[-1]
         d = np.angle(z[1:] * np.conj(z[:-1]))
+        # pilot tracking + RDS decoding run on the discriminator tap
+        self.pilot.process(d)
+        if self.pilot.present:
+            self.rds.set_ppm(self.pilot.ppm)
+        self.rds.process(d)
         audio = d * (self.IF_RATE / (2.0 * np.pi * WFM_DEV_HZ))
-        audio = self.dec2.process(audio.astype(np.complex64)).real
-        audio = self.deemph.process(audio.astype(np.float64))
+        y = self.dec2.process(audio.astype(np.complex64))
+        self.last_chan_db = 10.0 * float(np.log10(
+            np.mean(np.abs(y) ** 2) + 1e-12))
+        audio = self.deemph.process(y.real.astype(np.float64))
         return to_int16(audio)
 
     def reset(self):
-        self.nco.set_freq(-self.lo_offset)
+        self.nco.set_freq(self.lo_offset)
         self.dec1.reset()
         self.dec2.reset()
         self.deemph.reset()
+        self.pilot = PilotWatch(self.IF_RATE)
+        self.rds = rds_mod.RdsDecoder(self.IF_RATE)
+        self._last = np.complex64(0)
+
+
+class NbfmDemod:
+    """Narrowband FM for NOAA Weather Radio (5 kHz deviation, 25 kHz grid)."""
+
+    IF_RATE = 240_000
+
+    def __init__(self, fs, lo_offset_hz):
+        self.fs = float(fs)
+        self.lo_offset = float(lo_offset_hz)
+        self.nco = NcoMixer(self.lo_offset, self.fs)
+        self.dec1 = Decimator(10, 120_000, self.fs, numtaps=129)
+        # channel power tap (pre-discriminator): discriminator noise explodes
+        # on channel-less input, so squelch level must come from IF power
+        self.ptap = Decimator(5, 8_000, self.IF_RATE, numtaps=129)
+        # channel filter: Carson bandwidth 2*(5+3.4) ~ 17 kHz
+        self.dec2 = Decimator(5, 8_000, self.IF_RATE, numtaps=129)  # -> 48 kSPS
+        # voice band shaping: 3.4 kHz low-pass + 300 Hz high-pass
+        self.lpf_zi = np.zeros(128)
+        self.lpf_b = lowpass_taps(129, 3_400, AUDIO_RATE)
+        self.hpf_b, self.hpf_a = signal.butter(2, 300.0 / (AUDIO_RATE / 2.0),
+                                               "high")
+        self.hpf_zi = np.zeros(2)
+        self._agc = 0.3
+        self.last_chan_db = None
+        self._last = np.complex64(0)
+
+    def process(self, raw):
+        x = self.nco.process(raw)
+        x = self.dec1.process(x)
+        pt = self.ptap.process(x)
+        self.last_chan_db = 10.0 * float(np.log10(
+            np.mean(np.abs(pt) ** 2) + 1e-12))
+        z = np.concatenate(([self._last], x))
+        self._last = x[-1]
+        d = np.angle(z[1:] * np.conj(z[:-1]))
+        audio = d * (self.IF_RATE / (2.0 * np.pi * NBFM_DEV_HZ))
+        y = self.dec2.process(audio.astype(np.complex64))
+        audio = y.real
+        audio = signal.lfilter(self.lpf_b, 1.0, audio, zi=self.lpf_zi)[0]
+        audio = signal.lfilter(self.hpf_b, self.hpf_a, audio,
+                               zi=self.hpf_zi)[0]
+        # slow AGC lifts typical voice levels toward ~0.7 FS
+        peak = float(np.max(np.abs(audio)) + 1e-9)
+        self._agc = 0.999 * self._agc + 0.001 * peak
+        gain = min(0.7 / self._agc, 30.0)
+        return to_int16(audio * gain)
+
+    def reset(self):
+        self.nco.set_freq(self.lo_offset)
+        self.dec1.reset()
+        self.dec2.reset()
+        self.ptap.reset()
+        self.lpf_zi[:] = 0
+        self.hpf_zi[:] = 0
+        self._agc = 0.3
         self._last = np.complex64(0)
 
 
 class AmDemod:
-    """AM demodulator for direct-sampling input (envelope detection)."""
+    """AM demodulator (envelope detection).
+
+    Two operating modes:
+      * lo_offset_hz=0     - direct-sampling input, station mixed to exact DC
+                             (v3 Q-branch, used for the AM broadcast band)
+      * lo_offset_hz>0     - quadrature input with offset tuning (airband):
+                             the dongle tunes below the channel and the NCO
+                             shifts the station back to DC here
+    """
 
     IF_RATE = 240_000
 
-    def __init__(self, fs):
+    def __init__(self, fs, lo_offset_hz=0.0, channel_bw_hz=7_500):
         self.fs = float(fs)
-        self.nco = NcoMixer(0.0, self.fs)  # station mixed to exact DC
+        self.lo_offset = float(lo_offset_hz)
+        self.nco = NcoMixer(self.lo_offset, self.fs)
         self.dec1 = Decimator(10, 120_000, self.fs, numtaps=129)  # -> 240 kSPS
-        # sharp channel filter: pass 7.5 kHz, reject 10 kHz-spaced neighbors
-        self.dec2 = Decimator(5, 7_500, self.IF_RATE, numtaps=321)  # -> 48 kSPS
+        # sharp channel filter rejects the 25 kHz-spaced neighbours
+        self.dec2 = Decimator(5, channel_bw_hz, self.IF_RATE, numtaps=321)
         # DC blocker (~30 Hz high-pass) removes residual DC spike
         alpha = np.exp(-2.0 * np.pi * 30.0 / AUDIO_RATE)
         self.dc_b = np.array([1.0, -1.0])
         self.dc_a = np.array([1.0, -alpha])
         self.dc_zi = np.zeros(1)
         self._agc = 0.5
+        self.last_chan_db = None
 
     def process(self, raw):
         x = self.nco.process(raw)
         x = self.dec1.process(x)
         x = self.dec2.process(x)
+        self.last_chan_db = 10.0 * float(np.log10(
+            np.mean(np.abs(x) ** 2) + 1e-12))
         env = np.abs(x)                       # envelope of (1 + m(t))
         env, self.dc_zi = signal.lfilter(self.dc_b, self.dc_a, env, zi=self.dc_zi)
         # slow AGC so carrier level maps to ~0.8 FS regardless of signal strength
@@ -153,7 +300,7 @@ class AmDemod:
         return to_int16(audio)
 
     def reset(self):
-        self.nco.set_freq(0.0)
+        self.nco.set_freq(self.lo_offset)
         self.dec1.reset()
         self.dec2.reset()
         self.dc_zi[:] = 0

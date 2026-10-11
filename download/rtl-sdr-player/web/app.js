@@ -18,13 +18,20 @@ const S = {
   volume: 0.7,
   dragThrottle: 0,
   synced: false,
+  presets: null,
+  scanRunning: false,
+  squelchTouched: false,
 };
 
 const $ = (id) => document.getElementById(id);
 const FMT = {
   wfm: { div: 1e6, dec: 2, unit: "MHz", grid: 200e3, axis: (hz) => (hz / 1e6).toFixed(1) + "M" },
   am:  { div: 1e3, dec: 0, unit: "kHz", grid: 100e3, axis: (hz) => (hz / 1e3).toFixed(0) + "k" },
+  wx:  { div: 1e6, dec: 3, unit: "MHz", grid: 25e3, axis: (hz) => (hz / 1e6).toFixed(3) + "M" },
+  air: { div: 1e6, dec: 3, unit: "MHz", grid: 1e6, axis: (hz) => (hz / 1e6).toFixed(3) + "M" },
 };
+const STEP = { wfm: 100e3, am: 10e3, wx: 25e3, air: 25e3 };
+const BAND_DEFAULT = { wfm: 98.3e6, am: 990e3, wx: 162.55e6, air: 121.5e6 };
 const fmtFreq = (hz) => (hz / FMT[S.band].div).toFixed(FMT[S.band].dec);
 
 // ---------------------------------------------------------------- boot
@@ -54,6 +61,10 @@ function applyStatus(st) {
   S.deviceMode = st.mode;
   S.gains = st.gains || [];
   S.targetMs = st.target_buffer_ms || 2500;
+  S.presets = {};
+  for (const [key, b] of Object.entries(st.bands || {})) {
+    S.presets[key] = b.presets || [];
+  }
   if (S.node) S.node.port.postMessage({ type: "cfg", targetMs: S.targetMs });
 
   // first sync: adopt the server's band/frequency as the UI starting point
@@ -64,6 +75,8 @@ function applyStatus(st) {
     document.querySelectorAll(".tab").forEach((b) =>
       b.classList.toggle("active", b.dataset.band === S.band));
     updateReadout(S.freq);
+    renderPresets();
+    updatePanelVisibility();
   }
 
   // populate gain list once
@@ -78,11 +91,32 @@ function applyStatus(st) {
   $("stat-note").textContent = st.error ? ("⚠ " + st.error) :
     (st.note || "");
   $("band-desc").textContent = (st.bands?.[S.band]?.desc) || "";
+  const deemph = st.de_emphasis_us || 75;
+  const region = st.region || "US";
+  const demodLines = {
+    wfm: `WFM mono · offset-tuned · de-emphasis ${deemph} µs (${region}) · RDS/RBDS`,
+    wx: "NBFM 5 kHz dev · NOAA Weather Radio · offset-tuned",
+    air: "AM envelope · US airband 25 kHz channels · offset-tuned",
+    am: "AM envelope · direct-sampling (Q input)",
+  };
   $("demod-line").textContent =
-    (S.band === "am"
-      ? "AM envelope · direct-sampling (Q input)"
-      : "WFM mono · offset-tuned · de-emphasis 75 µs") +
-    " · 2.4 MSPS capture";
+    (demodLines[S.band] || S.band) + " · 2.4 MSPS capture";
+  $("dn").title = "-" + (STEP[S.band] / 1e3).toFixed(0) + " kHz";
+  $("up").title = "+" + (STEP[S.band] / 1e3).toFixed(0) + " kHz";
+
+  // scanner list options (once)
+  const listSel = $("scan-list");
+  if (listSel.options.length === 0 && st.scan_lists) {
+    for (const [key, label] of Object.entries(st.scan_lists)) {
+      const opt = document.createElement("option");
+      opt.value = key; opt.textContent = label;
+      listSel.appendChild(opt);
+    }
+  }
+  if (st.squelch_db != null && !S.squelchTouched) {
+    $("squelch").value = st.squelch_db;
+    $("squelch-val").textContent = st.squelch_db.toFixed(0) + " dB";
+  }
   $("stat-buffer").textContent = S.node
     ? $("stat-buffer").textContent  // live reading comes from the worklet
     : (S.targetMs / 1000).toFixed(1) + " s target";
@@ -118,6 +152,33 @@ function wireControls() {
     });
   });
 
+  // scanner controls
+  $("scan-btn").onclick = () => {
+    if (S.scanRunning) {
+      fetch("/api/scan", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "stop" }) });
+    } else {
+      fetch("/api/scan", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "start",
+                               list: $("scan-list").value,
+                               squelch_db: parseFloat($("squelch").value) }) });
+    }
+  };
+  let sqTimer = null;
+  $("squelch").addEventListener("input", (e) => {
+    S.squelchTouched = true;
+    const db = parseFloat(e.target.value);
+    $("squelch-val").textContent = db.toFixed(0) + " dB";
+    clearTimeout(sqTimer);
+    sqTimer = setTimeout(() => {
+      fetch("/api/squelch", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ db }) });
+    }, 200);
+  });
+
   const spec = $("spectrum");
   spec.addEventListener("pointerdown", (e) => {
     spec.setPointerCapture(e.pointerId);
@@ -135,14 +196,32 @@ function switchBand(band) {
   $("radio-controls").style.visibility = band === "tv" ? "hidden" : "visible";
   $("view-spectrum").hidden = band === "tv";
   $("view-tv").hidden = band !== "tv";
+  renderPresets();
+  updatePanelVisibility();
   if (band === "tv") { renderTv(); return; }
-  const defaultFreq = band === "am" ? 990e3 : 98.3e6;
-  tuneTo(band, band !== prevBand ? defaultFreq : S.freq);
+  tuneTo(band, band !== prevBand ? BAND_DEFAULT[band] : S.freq);
+}
+
+function renderPresets() {
+  const wrap = $("presets");
+  wrap.innerHTML = "";
+  const presets = (S.presets && S.presets[S.band]) || [];
+  for (const p of presets) {
+    const btn = document.createElement("button");
+    btn.className = "chip";
+    btn.textContent = p.label;
+    btn.onclick = () => tuneTo(S.band, p.hz);
+    wrap.appendChild(btn);
+  }
+}
+
+function updatePanelVisibility() {
+  $("rds-panel").hidden = S.band !== "wfm";
+  $("scan-panel").hidden = !(S.band === "air" || S.band === "wx");
 }
 
 function nudge(mult) {
-  const step = { wfm: 100e3, am: 10e3 }[S.band] * mult;
-  tuneTo(S.band, S.freq + step);
+  tuneTo(S.band, S.freq + (STEP[S.band] || 100e3) * mult);
 }
 
 function submitFreq() {
@@ -173,6 +252,14 @@ function updateReadout(freq) {
   $("freq-display").textContent = fmtFreq(freq);
   $("freq-unit").textContent = FMT[S.band].unit;
   $("freq-input").value = fmtFreq(freq);
+  document.querySelectorAll("#presets .chip").forEach((c) =>
+    c.classList.remove("active"));
+  const presets = (S.presets && S.presets[S.band]) || [];
+  const hit = presets.findIndex((p) => Math.abs(p.hz - freq) < 500);
+  if (hit >= 0) {
+    const chips = document.querySelectorAll("#presets .chip");
+    if (chips[hit]) chips[hit].classList.add("active");
+  }
 }
 
 function tuneFromPixel(ev, immediate) {
@@ -184,7 +271,7 @@ function tuneFromPixel(ev, immediate) {
   const frac = (ev.clientX - rect.left) / rect.width;
   const off = S.psd.axis_hz0 + frac * (S.psd.axis_hz1 - S.psd.axis_hz0);
   const target = Math.round(S.psd.center_hz + off);
-  const step = { wfm: 100e3, am: 10e3 }[S.band];
+  const step = STEP[S.band] || 100e3;
   const snapped = Math.round(target / step) * step;
   updateReadout(snapped);
   tuneTo(S.band, snapped);
@@ -270,6 +357,11 @@ function connectSpectrum(proto) {
       drawWaterfall();
       drawAxis(ev);
       updateMeter(ev);
+      updateRds(ev);
+      updateScan(ev);
+      if (ev.band === S.band && Math.abs(ev.freq_hz - S.freq) > 500) {
+        updateReadout(ev.freq_hz);   // server-driven change (e.g. scanner)
+      }
       $("scope-info").textContent =
         (ev.span_hz / 1e6).toFixed(2) + " MHz span · center " +
         (ev.center_hz / 1e6).toFixed(3) + " MHz";
@@ -288,6 +380,83 @@ function updateMeter(psd) {
   const pct = Math.max(0, Math.min(100, ((snr - 3) / 35) * 100));
   $("meter-fill").style.width = pct.toFixed(0) + "%";
   $("meter-db").textContent = snr.toFixed(1) + " dB";
+}
+
+// ---------------------------------------------------------------- RDS panel
+function updateRds(ev) {
+  if (S.band !== "wfm" || !ev.rds) return;
+  const r = ev.rds;
+  $("rds-ps").textContent = r.ps || "\u2014";
+  const flags = [];
+  flags.push(r.pilot ? '<span class="on">STEREO</span>' : "mono");
+  if (r.tp) flags.push('<span class="on">TP</span>');
+  if (r.ta) flags.push('<span class="on">TA</span>');
+  if (r.locked && r.pilot) flags.push('<span class="on">LOCK</span>');
+  $("rds-flags").innerHTML = flags.join(" \u00b7 ");
+  if (!r.pilot) {
+    $("rds-meta").textContent = "no pilot \u00b7 no RDS on this signal";
+  } else if (!r.ps) {
+    $("rds-meta").textContent =
+      "pilot " + (r.pilot_db == null ? "?" : r.pilot_db.toFixed(0)) +
+      " dB \u00b7 decoding\u2026 (" + r.groups + " groups)";
+  } else {
+    const bits = ["PI " + (r.pi || "\u2014"), r.pty || ""];
+    if (r.clock) bits.push(r.clock);
+    $("rds-meta").textContent = bits.filter(Boolean).join(" \u00b7 ");
+  }
+  $("rds-rt").textContent = r.radiotext || "";
+  $("rds-af").textContent =
+    r.af_mhz && r.af_mhz.length
+      ? "AF: " + r.af_mhz.map((f) => f.toFixed(1)).join("  ") + " MHz"
+      : "";
+}
+
+// ------------------------------------------------------------ scanner panel
+function updateScan(ev) {
+  const sc = ev.scan;
+  if (!sc) return;
+  S.scanRunning = !!sc.running;
+  const stateEl = $("scan-state");
+  if (!sc.running && sc.list == null) {
+    stateEl.textContent = "idle";
+    stateEl.className = "scan-state";
+  } else if (sc.running) {
+    stateEl.textContent = sc.state === "hold"
+      ? "HOLD " + (sc.freq_hz / 1e6).toFixed(3)
+      : "scanning " + (sc.idx + 1) + "/" + sc.count;
+    stateEl.className = "scan-state " + (sc.state === "hold" ? "hold" : "run");
+    if ((S.band === "wx" || S.band === "air") &&
+        Math.abs(sc.freq_hz - S.freq) > 500) {
+      updateReadout(sc.freq_hz);
+    }
+  } else {
+    stateEl.textContent = "stopped";
+    stateEl.className = "scan-state";
+  }
+  $("scan-btn").textContent = sc.running ? "Stop" : "Scan";
+
+  if (ev.chan_db != null) {
+    const pct = Math.max(0, Math.min(100, ((ev.chan_db - -60) / 55) * 100));
+    const fill = $("chan-fill");
+    fill.style.width = pct.toFixed(0) + "%";
+    fill.style.background = ev.squelch_open
+      ? "linear-gradient(90deg, #0e7490, #34d399)"
+      : "linear-gradient(90deg, #0e7490, #22d3ee)";
+    $("chan-val").textContent = ev.chan_db.toFixed(0) + " dB" +
+      (ev.squelch_open ? " open" : "");
+  }
+
+  const log = $("scan-log");
+  if (sc.log && sc.log.length) {
+    log.innerHTML = sc.log.slice(0, 4).map((e) => {
+      const t = new Date(e.t * 1000).toLocaleTimeString([],
+        { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      return '<div class="hit">' + t + "  " +
+        (e.hz / 1e6).toFixed(3) + " MHz</div>";
+    }).join("");
+  } else if (!sc.running) {
+    log.innerHTML = "<div class='empty'>no activity logged yet</div>";
+  }
 }
 
 // ---------------------------------------------------------------- spectrum

@@ -14,6 +14,8 @@ import time
 
 import numpy as np
 
+from . import rds as rds_mod
+
 IS_WINDOWS = platform.system() == "Windows"
 
 
@@ -88,14 +90,24 @@ class RtlSdrDevice:
 class SimDevice:
     is_real = False
 
-    # Synthetic stations: (absolute Hz, amplitude)
-    FM_STATIONS = [
-        (88.5e6, 0.55), (92.3e6, 0.40), (96.1e6, 0.72),
-        (99.9e6, 0.50), (103.7e6, 0.62), (107.1e6, 0.34),
+    # Synthetic stations: (absolute Hz, amplitude, kind)
+    #   kind "wfm"  - broadcast FM music-like modulation
+    #   kind "rds"  - wfm + 19 kHz pilot + RDS subcarrier (decoder test)
+    #   kind "am"   - AM voice (airband quadrature or AM-band direct)
+    #   kind "nbfm" - narrowband FM voice (NOAA weather)
+    STATIONS = [
+        (88.5e6, 0.55, "wfm"), (92.3e6, 0.40, "wfm"),
+        (96.1e6, 0.72, "rds"),
+        (99.9e6, 0.50, "wfm"), (103.7e6, 0.62, "wfm"), (107.1e6, 0.34, "wfm"),
+        (640e3, 0.50, "am"), (820e3, 0.66, "am"),
+        (1010e3, 0.42, "am"), (1330e3, 0.56, "am"),
+        (121.5e6, 0.50, "am"), (122.8e6, 0.42, "am"), (123.1e6, 0.38, "am"),
+        (162.400e6, 0.45, "nbfm"), (162.550e6, 0.55, "nbfm"),
     ]
-    AM_STATIONS = [
-        (640e3, 0.50), (820e3, 0.66), (1010e3, 0.42), (1330e3, 0.56),
-    ]
+
+    RDS_PI = 0x2A5B
+    RDS_PS = "SIM-RDS"
+    RDS_RT = "RTL-SDR Player 1.1 - RDS ok - USA 75us deemph"
 
     def __init__(self):
         self.center = 98.3e6
@@ -103,6 +115,10 @@ class SimDevice:
         self._t = 0.0  # continuous time base (seconds)
         self.direct_sampling = "disabled"
         self._rng = np.random.default_rng(1234)
+        self._rds = rds_mod.RdsEncoder(
+            pi=self.RDS_PI, ps=self.RDS_PS, radiotext=self.RDS_RT,
+            pty=9, ms=1, af_codes=(87, 124))  # 96.2 / 99.9 MHz alternates
+        self._acc = {}  # station freq -> [pilot phase acc, rds phase acc, nbfm acc]
 
     @property
     def name(self):
@@ -126,6 +142,12 @@ class SimDevice:
     def set_bias_tee(self, on):
         pass
 
+    def _acc_for(self, freq):
+        acc = self._acc.get(freq)
+        if acc is None:
+            acc = self._acc[freq] = [0.0, 0.0, 0.0]
+        return acc
+
     def read_iq(self, num_samples):
         n = int(num_samples)
         fs = float(self.rate)
@@ -133,29 +155,53 @@ class SimDevice:
         t = t0 + np.arange(n, dtype=np.float64) / fs
         self._t = t0 + n / fs
 
-        is_am = self.direct_sampling in ("q", "i", 1, 2)
-        stations = self.AM_STATIONS if is_am else self.FM_STATIONS
+        is_am_band = self.direct_sampling in ("q", "i", 1, 2)
+        two_pi = 2.0 * math.pi
 
         out = (self._rng.standard_normal(n)
                + 1j * self._rng.standard_normal(n)).astype(np.complex64) * 0.035
 
-        for freq, amp in stations:
+        for freq, amp, kind in self.STATIONS:
             off = freq - self.center
-            if abs(off) > fs * 0.47:
+            if is_am_band:
+                if kind != "am":
+                    continue
+                # direct sampling: the tuned station lands at DC naturally
+            elif abs(off) > fs * 0.47:
                 continue  # station outside the captured window
-            # Three-tone "music-like" modulation unique per station
+
+            # Three-tone modulation unique per station
             k = int(abs(freq) / 1e6)
-            m1 = 2.0 * math.pi * (220.0 + 40.0 * k) * t
-            m2 = 2.0 * math.pi * (331.0 + 17.0 * k) * t + 1.1
-            m3 = 2.0 * math.pi * (523.0 + 11.0 * k) * t + 2.3
+            m1 = two_pi * (220.0 + 40.0 * k) * t
+            m2 = two_pi * (331.0 + 17.0 * k) * t + 1.1
+            m3 = two_pi * (523.0 + 11.0 * k) * t + 2.3
             audio = (np.sin(m1) + 0.5 * np.sin(m2) + 0.25 * np.sin(m3)) / 1.75
-            lfo = 0.75 + 0.25 * np.sin(2.0 * math.pi * 0.13 * t + k)
-            if is_am:
-                sig = (1.0 + 0.6 * audio * lfo) * np.exp(
-                    1j * (2.0 * math.pi * off * t)).astype(np.complex64)
-            else:
-                phase = (2.0 * math.pi * off * t
-                         + 5.2 * audio * lfo)  # ~5.2 rad dev ~ 75 kHz at fs
+            lfo = 0.75 + 0.25 * np.sin(two_pi * 0.13 * t + k)
+
+            if kind == "am":
+                # AM voice: carrier + modulated sidebands
+                sig = (1.0 + 0.5 * audio * lfo) * np.exp(
+                    1j * (two_pi * off * t)).astype(np.complex64)
+            elif kind == "nbfm":
+                # +/-5 kHz deviation, integrated properly for the NBFM scale
+                acc = self._acc_for(freq)
+                c = np.cumsum(5000.0 * audio * lfo)
+                ph = two_pi * off * t + acc[2] + two_pi * c / fs
+                acc[2] = (acc[2] + two_pi * float(c[-1]) / fs) % two_pi
+                sig = np.exp(1j * ph).astype(np.complex64)
+            elif kind == "rds":
+                # wfm music + 9% pilot + RDS subcarrier (DSB-SC, +/-2 kHz)
+                acc = self._acc_for(freq)
+                cp = np.cumsum(6750.0 * np.sin(two_pi * 19000.0 * t))
+                cr = np.cumsum(self._rds.subcarrier_dev(t, 0.0))
+                ph = (two_pi * off * t + 5.2 * audio * lfo
+                      + acc[0] + two_pi * cp / fs
+                      + acc[1] + two_pi * cr / fs)
+                acc[0] = (acc[0] + two_pi * float(cp[-1]) / fs) % two_pi
+                acc[1] = (acc[1] + two_pi * float(cr[-1]) / fs) % two_pi
+                sig = np.exp(1j * ph).astype(np.complex64)
+            else:  # plain wfm
+                phase = (two_pi * off * t + 5.2 * audio * lfo)
                 sig = np.exp(1j * phase).astype(np.complex64)
             out += (amp * sig).astype(np.complex64)
 

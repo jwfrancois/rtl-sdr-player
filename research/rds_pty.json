@@ -1,0 +1,38 @@
+[
+  {
+    "url": "https://www.facebook.com/fb-answers",
+    "name": "NOAA Weather Radio Codes and Frequencies Explained",
+    "snippet": "NOAA Weather Radio broadcasts 24/7 on seven VHF frequencies and uses six-digit SAME county codes to target alerts. you can find codes at weather.gov/nwr or by ...\nNOAA Weather Radio uses Specific Area Message Encoding (SAME) codes so your radio only alerts you for your county, not the whole state. Read more",
+    "host_name": "www.facebook.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://documents.dps.ny.gov/public/ViewDoc",
+    "name": "Appendix 6-B Emergency Services Response Plan",
+    "snippet": "EHS Management System. Emergency Services Response Plan (PV+BESS). Emergency Services Response Plan. Page 2 / 38. Contents. Contents . Read more",
+    "host_name": "documents.dps.ny.gov",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.duke-energy.com/pdfs/safety/nuclear",
+    "name": "ep-booklet-catawba27.pdf",
+    "snippet": "No information is available for this page. Learn why",
+    "host_name": "www.duke-energy.com",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.scribd.com/document/NWR-Poster",
+    "name": "NOAA Weather Radio All Hazards Guide | PDF",
+    "snippet": "SAME is a digital code that is sent with many warnings, watches, and emergency events. The SAME includes the type of event, the applicable geographic area for ...",
+    "host_name": "www.scribd.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  }
+]
