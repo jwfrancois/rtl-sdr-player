@@ -58,6 +58,18 @@
 
       <div class="presets" id="presets"></div>
 
+      <div class="bookmarks" id="bookmarks-panel">
+        <div class="mem-head">
+          <span class="lbl">BOOKMARKS</span>
+          <button id="bmk-add" class="btn btn-mini" title="Bookmark the current frequency">+ Add</button>
+        </div>
+        <div class="bmk-add-row" id="bmk-add-row" hidden>
+          <input id="bmk-name" maxlength="40" placeholder="Name" spellcheck="false">
+          <button id="bmk-save" class="btn btn-mini btn-accent">Save</button>
+        </div>
+        <div class="bmk-list" id="bmk-list"></div>
+      </div>
+
       <div class="mode-row" id="mode-row" hidden></div>
 
       <div class="scan-row sq-row bfo-row" id="bfo-row" hidden>
@@ -124,6 +136,12 @@
           <div class="meter"><div class="meter-fill chan" id="chan-fill"></div></div>
           <span class="scan-db" id="chan-val">&mdash;</span>
         </div>
+        <div class="scan-row sq-row" id="ctcss-row" hidden>
+          <span class="lbl">CTC</span>
+          <select id="ctcss-select" title="CTCSS tone squelch (NBFM)">
+            <option value="0">CTCSS off (carrier only)</option>
+          </select>
+        </div>
         <div class="mem-head">
           <span class="lbl">MEMORY</span>
           <button id="mem-clear" class="btn btn-mini" title="Clear learned activity">Clear</button>
@@ -140,13 +158,19 @@
     <div class="scope-head">
       <span class="scope-title">SPECTRUM</span>
       <span class="scope-info" id="scope-info">&mdash;</span>
+      <span class="zoom-ctl">
+        <button id="zoom-out" class="btn btn-mini" title="Zoom out">&minus;</button>
+        <span id="zoom-level">1.0&times;</span>
+        <button id="zoom-in" class="btn btn-mini" title="Zoom in">+</button>
+        <button id="zoom-reset" class="btn btn-mini" title="Reset zoom">&#x2922;</button>
+      </span>
     </div>
     <div class="canvas-wrap">
       <canvas id="spectrum"></canvas>
       <div class="freq-axis" id="freq-axis"></div>
       <canvas id="waterfall"></canvas>
     </div>
-    <div class="scope-hint">Click or drag anywhere on the spectrum to tune &middot; waterfall scrolls below</div>
+    <div class="scope-hint">Click or drag to tune &middot; wheel zooms &middot; double-click resets zoom</div>
   </section>
 
   <!-- ===================== RIGHT: TV ===================== -->

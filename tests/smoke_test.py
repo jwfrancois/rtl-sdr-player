@@ -69,7 +69,7 @@ async def main():
     # ---- 1. status ----
     st = rest("/api/status")
     st_bands_wx_presets = st["bands"]["wx"]["presets"]
-    check("status version 1.2.0", st["version"] == "1.2.0", st["version"])
+    check("status version 1.3.0", st["version"] == "1.3.0", st["version"])
     check("region US", st.get("region") == "US")
     check("de-emphasis 75 us", st.get("de_emphasis_us") == 75)
     check("bands wx+air present", "wx" in st["bands"] and "air" in st["bands"])
@@ -219,6 +219,80 @@ async def main():
     mem = rest("/api/scan/memory")["memory"]
     check("memory clears", len(mem) == 0, str(mem))
 
+    # ---- 7b. CTCSS tone squelch (NBFM): 162.550 carries 141.3 in the sim ----
+    rest("/api/tune", {"band": "wx", "freq_hz": 162_550_000})
+    rest("/api/squelch", {"db": -20})
+    await asyncio.sleep(1.0)
+    r = rest("/api/ctcss", {"hz": 123.0})
+    check("ctcss tone accepted", r.get("ok") is True
+          and r.get("ctcss_hz") == 123.0, str(r))
+    await asyncio.sleep(1.5)
+    chunks = []
+    await collect_audio(1.5, chunks)
+    rms_wrong_tone = rms_of(chunks)
+    check("ctcss wrong tone mutes audio", rms_wrong_tone < -55,
+          f"{rms_wrong_tone:.1f} dBFS")
+    st = rest("/api/status")
+    check("ctcss gate reported closed", st["ctcss_open"] is False
+          and st["ctcss_hz"] == 123.0, f"dev={st['ctcss_dev_hz']}")
+    rest("/api/ctcss", {"hz": 141.3})
+    await asyncio.sleep(1.8)
+    chunks = []
+    await collect_audio(1.5, chunks)
+    rms_right_tone = rms_of(chunks)
+    check("ctcss correct tone passes audio",
+          rms_right_tone > rms_wrong_tone + 15,
+          f"{rms_right_tone:.1f} vs {rms_wrong_tone:.1f} dBFS")
+    import urllib.error
+    try:
+        rest("/api/ctcss", {"hz": 123.4})
+        check("ctcss invalid tone rejected", False)
+    except urllib.error.HTTPError as exc:
+        check("ctcss invalid tone rejected", exc.code == 400,
+              f"HTTP {exc.code}")
+    rest("/api/ctcss", {"hz": 0})
+
+    # ---- 7c. SDR#-style bookmarks ----
+    n0 = len(rest("/api/bookmarks")["bookmarks"])
+    r = rest("/api/bookmarks", {"name": "WX1 sim", "band": "wx",
+                                "freq_hz": 162_550_000, "mode": "nbfm"})
+    check("bookmark add (explicit)", r.get("ok") is True,
+          str(r.get("bookmark")))
+    rest("/api/tune", {"band": "wfm", "freq_hz": 99_900_000})
+    await asyncio.sleep(0.3)
+    r2 = rest("/api/bookmarks", {})   # default = current state
+    check("bookmark add (default current)",
+          r2.get("ok") is True and r2["bookmark"]["band"] == "wfm"
+          and r2["bookmark"]["freq_hz"] == 99_900_000,
+          str(r2.get("bookmark")))
+    bl = rest("/api/bookmarks")["bookmarks"]
+    check("bookmark list grows + sorted",
+          len(bl) == n0 + 2
+          and all(bl[i]["freq_hz"] <= bl[i + 1]["freq_hz"]
+                  for i in range(len(bl) - 1)),
+          str([(b["band"], b["freq_hz"]) for b in bl]))
+    bwx = next(b for b in bl if b["name"] == "WX1 sim")
+    rest("/api/tune", {"band": bwx["band"], "freq_hz": bwx["freq_hz"],
+                       "mode": bwx["mode"]})
+    await asyncio.sleep(0.8)
+    st = rest("/api/status")
+    check("bookmark jump tunes + restores mode",
+          st["freq_hz"] == bwx["freq_hz"] and st["band"] == "wx"
+          and st["demod_mode"] == "nbfm",
+          f"{st['band']} {st['freq_hz']} {st['demod_mode']}")
+    try:
+        rest("/api/bookmarks", {"band": "shortwave", "freq_hz": 1_000_000})
+        check("bookmark invalid band rejected", False)
+    except urllib.error.HTTPError as exc:
+        check("bookmark invalid band rejected", exc.code == 400,
+              f"HTTP {exc.code}")
+    rest("/api/bookmarks/delete", {"id": bwx["id"]})
+    b2 = next(b for b in rest("/api/bookmarks")["bookmarks"]
+              if b["freq_hz"] == 99_900_000)
+    rest("/api/bookmarks/delete", {"id": b2["id"]})
+    check("bookmark delete",
+          len(rest("/api/bookmarks")["bookmarks"]) == n0)
+
     # ---- 8. SSB (USB/LSB) on the airband ----
     r = rest("/api/tune", {"band": "air", "freq_hz": 119_200_000,
                            "mode": "usb"})
@@ -250,7 +324,6 @@ async def main():
     rms = rms_of(chunks)
     check("ssb lsb audio audible", rms > -40, f"{rms:.1f} dBFS")
     # mode validation (server answers 400)
-    import urllib.error
     try:
         bad = rest("/api/tune", {"band": "wfm", "freq_hz": 99_900_000,
                                  "mode": "usb"})

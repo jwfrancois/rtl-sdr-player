@@ -22,6 +22,8 @@ const S = {
   presets: null,
   scanRunning: false,
   squelchTouched: false,
+  zoom: { lo: 0, hi: 1 },   // visible window as fractions of the PSD axis
+  ctcssTouched: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -44,6 +46,7 @@ async function boot() {
   connectSockets();          // spectrum/status must not depend on audio
   initAudio().catch((e) => console.warn("audio init deferred:", e));
   pollStatus();
+  refreshBookmarks();
 }
 
 async function refreshStatus() {
@@ -128,6 +131,18 @@ function applyStatus(st) {
   if (st.squelch_db != null && !S.squelchTouched) {
     $("squelch").value = st.squelch_db;
     $("squelch-val").textContent = st.squelch_db.toFixed(0) + " dB";
+  }
+  // CTCSS tone list (once) + value sync while the user is not dragging it
+  const csel = $("ctcss-select");
+  if (csel.options.length <= 1 && Array.isArray(st.ctcss_tones)) {
+    for (const t of st.ctcss_tones) {
+      const opt = document.createElement("option");
+      opt.value = t; opt.textContent = t.toFixed(1) + " Hz";
+      csel.appendChild(opt);
+    }
+  }
+  if (!S.ctcssTouched && csel.value !== String(st.ctcss_hz || 0)) {
+    csel.value = String(st.ctcss_hz || 0);
   }
   $("stat-buffer").textContent = S.node
     ? $("stat-buffer").textContent  // live reading comes from the worklet
@@ -222,6 +237,51 @@ function wireControls() {
     spec.onpointermove = (ev) => tuneFromPixel(ev, false);
     spec.onpointerup = () => { spec.onpointermove = null; };
   });
+
+  // ---- waterfall zoom (wheel = zoom at cursor, double-click = reset) ----
+  for (const cv of [spec, $("waterfall")]) {
+    cv.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const rect = cv.getBoundingClientRect();
+      const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      zoomAt(frac, e.deltaY < 0 ? 1 / 1.25 : 1.25);
+    }, { passive: false });
+    cv.addEventListener("dblclick", () => applyZoom(0, 1));
+  }
+  $("zoom-in").onclick = () => zoomAt(0.5, 1 / 1.6);
+  $("zoom-out").onclick = () => zoomAt(0.5, 1.6);
+  $("zoom-reset").onclick = () => applyZoom(0, 1);
+
+  // ---- CTCSS tone squelch (NBFM) ----
+  $("ctcss-select").addEventListener("change", (e) => {
+    S.ctcssTouched = true;
+    fetch("/api/ctcss", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hz: parseFloat(e.target.value) }) });
+  });
+
+  // ---- bookmarks ----
+  $("bmk-add").onclick = () => {
+    const row = $("bmk-add-row");
+    row.hidden = false;
+    const inp = $("bmk-name");
+    inp.value = fmtFreq(S.freq) + " " + FMT[S.band].unit;
+    inp.focus(); inp.select();
+  };
+  const bmkSave = () => {
+    const name = $("bmk-name").value.trim();
+    $("bmk-add-row").hidden = true;
+    fetch("/api/bookmarks", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, band: S.band, freq_hz: S.freq,
+                             mode: S.mode }) })
+      .then(() => refreshBookmarks());
+  };
+  $("bmk-save").onclick = bmkSave;
+  $("bmk-name").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") bmkSave();
+    if (e.key === "Escape") $("bmk-add-row").hidden = true;
+  });
 }
 
 function switchBand(band) {
@@ -230,6 +290,7 @@ function switchBand(band) {
     b.classList.toggle("active", b.dataset.band === band));
   S.band = band;
   S.mode = null;  // let the new band pick its default demodulator
+  applyZoom(0, 1);  // zoom window is relative to the span -> reset per band
   $("radio-controls").style.visibility = band === "tv" ? "hidden" : "visible";
   $("view-spectrum").hidden = band === "tv";
   $("view-tv").hidden = band !== "tv";
@@ -277,6 +338,7 @@ function renderPresets() {
 function updatePanelVisibility() {
   $("rds-panel").hidden = S.band !== "wfm";
   $("scan-panel").hidden = !(S.band === "air" || S.band === "wx");
+  $("ctcss-row").hidden = S.band !== "wx";   // CTCSS rides the NBFM path
 }
 
 function nudge(mult) {
@@ -331,7 +393,9 @@ function tuneFromPixel(ev, immediate) {
   if (!S.psd) return;
   const rect = ev.target.getBoundingClientRect();
   const frac = (ev.clientX - rect.left) / rect.width;
-  const off = S.psd.axis_hz0 + frac * (S.psd.axis_hz1 - S.psd.axis_hz0);
+  // display fraction -> PSD axis fraction through the zoom window
+  const axFrac = S.zoom.lo + frac * (S.zoom.hi - S.zoom.lo);
+  const off = S.psd.axis_hz0 + axFrac * (S.psd.axis_hz1 - S.psd.axis_hz0);
   const target = Math.round(S.psd.center_hz + off);
   const step = STEP[S.band] || 100e3;
   const snapped = Math.round(target / step) * step;
@@ -425,8 +489,9 @@ function connectSpectrum(proto) {
       if (ev.band === S.band && Math.abs(ev.freq_hz - S.freq) > 500) {
         updateReadout(ev.freq_hz);   // server-driven change (e.g. scanner)
       }
+      const visSpan = ev.span_hz * (S.zoom.hi - S.zoom.lo);
       $("scope-info").textContent =
-        (ev.span_hz / 1e6).toFixed(2) + " MHz span · center " +
+        (visSpan / 1e6).toFixed(2) + " MHz visible · center " +
         (ev.center_hz / 1e6).toFixed(3) + " MHz";
     }
   };
@@ -480,9 +545,30 @@ function updateSql(ev) {
   if (ev.squelch_db == null) { line.hidden = true; return; }
   line.hidden = false;
   const open = !!ev.squelch_open;
-  $("sql-dot").className = "dot " + (open ? "sql-open" : "sql-closed");
-  $("sql-text").textContent = "SQUELCH " + (open ? "OPEN" : "CLOSED") +
+  let txt = "SQUELCH " + (open ? "OPEN" : "CLOSED") +
     " \u00b7 " + ev.squelch_db.toFixed(0) + " dB";
+  if (ev.ctcss_hz > 0 && S.band === "wx") {
+    txt += " \u00b7 CTC " + ev.ctcss_hz.toFixed(1) +
+      (ev.ctcss_open ? " \u2713" : " \u2013");
+  }
+  $("sql-dot").className = "dot " + (open ? "sql-open" : "sql-closed");
+  $("sql-text").textContent = txt;
+}
+
+// ---------------------------------------------------------------- zoom
+function applyZoom(lo, hi) {
+  const MIN = 10 / 512;  // never narrower than ~10 PSD bins
+  lo = Math.max(0, Math.min(lo, 1 - MIN));
+  hi = Math.min(1, Math.max(hi, lo + MIN));
+  S.zoom = (hi - lo >= 0.999) ? { lo: 0, hi: 1 } : { lo, hi };
+  $("zoom-level").textContent = (1 / (S.zoom.hi - S.zoom.lo)).toFixed(1) + "\u00d7";
+  if (S.psd) { drawSpectrum(); drawWaterfall(); drawAxis(S.psd); }
+}
+
+function zoomAt(frac, factor) {
+  const z = S.zoom;
+  const f = z.lo + frac * (z.hi - z.lo);
+  applyZoom(f - (f - z.lo) * factor, f + (z.hi - f) * factor);
 }
 
 // ------------------------------------------------------------ scanner panel
@@ -553,6 +639,58 @@ function updateScan(ev) {
   }
 }
 
+// -------------------------------------------------------------- bookmarks
+const BAND_TAG = { wfm: "FM", am: "AM", wx: "WX", air: "AIR" };
+
+async function refreshBookmarks() {
+  try {
+    const data = await (await fetch("/api/bookmarks")).json();
+    renderBookmarks(data.bookmarks || []);
+  } catch { /* server gone; pollStatus will resync */ }
+}
+
+function renderBookmarks(list) {
+  const el = $("bmk-list");
+  if (!list.length) {
+    el.innerHTML = "<div class='empty'>no bookmarks yet — tune somewhere and press + Add</div>";
+    return;
+  }
+  el.innerHTML = list.map((b) => {
+    const tag = BAND_TAG[b.band] || (b.band || "").toUpperCase();
+    const mode = b.mode && b.mode !== b.band
+      ? ' <span class="bmk-mode">' + b.mode.toUpperCase() + "</span>" : "";
+    const freq = b.band === "am"
+      ? (b.freq_hz / 1e3).toFixed(0) + "k"
+      : (b.freq_hz / 1e6).toFixed(3);
+    return '<div class="bmk-row" data-id="' + b.id + '">' +
+      '<span class="bmk-band">' + tag + "</span>" +
+      '<span class="bmk-name">' + escapeHtml(b.name) + mode + "</span>" +
+      '<span class="bmk-freq">' + freq + "</span>" +
+      '<button class="bmk-del" title="Delete bookmark">&times;</button></div>';
+  }).join("");
+  el.querySelectorAll(".bmk-row").forEach((row) => {
+    const b = list.find((x) => String(x.id) === row.dataset.id);
+    if (!b) return;
+    row.onclick = (e) => {
+      if (e.target.classList.contains("bmk-del")) {
+        fetch("/api/bookmarks/delete", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: b.id }) })
+          .then(() => refreshBookmarks());
+        return;
+      }
+      S.mode = b.mode || null;           // restore the saved demodulator
+      tuneTo(b.band, b.freq_hz);
+    };
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
 // ---------------------------------------------------------------- spectrum
 const specCv = $("spectrum");
 const wfCv = $("waterfall");
@@ -619,15 +757,18 @@ function drawSpectrum() {
   const psd = S.psd.psd_db;
   const top = psd_floor() + 52, bot = psd_floor() - 6;
   const yOf = (db) => h - ((db - bot) / (top - bot)) * h;
-  const xOf = (i) => (i / (psd.length - 1)) * w;
+  const zlo = S.zoom.lo, zhi = S.zoom.hi, zspan = zhi - zlo;
+  const xOf = (i) => ((i / (psd.length - 1)) - zlo) / zspan * w;
 
-  // grid at band steps
+  // grid at band steps (only inside the visible window)
   ctx.strokeStyle = "#101c26";
-  const span = S.psd.axis_hz1 - S.psd.axis_hz0;
+  const axisSpan = S.psd.axis_hz1 - S.psd.axis_hz0;
   const gridStep = FMT[S.band].grid;
-  const first = Math.ceil((S.psd.center_hz + S.psd.axis_hz0) / gridStep) * gridStep;
-  for (let f = first; f < S.psd.center_hz + S.psd.axis_hz1; f += gridStep) {
-    const x = ((f - S.psd.center_hz - S.psd.axis_hz0) / span) * w;
+  const viewLoHz = S.psd.axis_hz0 + zlo * axisSpan;
+  const viewHiHz = S.psd.axis_hz0 + zhi * axisSpan;
+  const first = Math.ceil((S.psd.center_hz + viewLoHz) / gridStep) * gridStep;
+  for (let f = first; f < S.psd.center_hz + viewHiHz; f += gridStep) {
+    const x = ((f - S.psd.center_hz - viewLoHz) / (zspan * axisSpan)) * w;
     ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
   }
 
@@ -655,8 +796,9 @@ function drawSpectrum() {
 
   // tuned-frequency marker
   const off = S.freq - S.psd.center_hz;
-  if (off >= S.psd.axis_hz0 && off <= S.psd.axis_hz1) {
-    const x = ((off - S.psd.axis_hz0) / span) * w;
+  const offFrac = (off - S.psd.axis_hz0) / axisSpan;
+  if (offFrac >= zlo && offFrac <= zhi) {
+    const x = ((offFrac - zlo) / zspan) * w;
     ctx.strokeStyle = "#fbbf24";
     ctx.setLineDash([4, 4]);
     ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
@@ -694,13 +836,17 @@ function drawWaterfall() {
 
   const ctx = sizeCanvas(wfCv);
   ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(wfOff, 0, 0, wfCv.clientWidth, wfCv.clientHeight);
+  // crop the full-span history to the visible zoom window
+  const sx = S.zoom.lo * 512, sw = (S.zoom.hi - S.zoom.lo) * 512;
+  ctx.drawImage(wfOff, sx, 0, sw, 256,
+                0, 0, wfCv.clientWidth, wfCv.clientHeight);
 }
 
 function drawAxis(psd) {
   const el = $("freq-axis");
-  const lo = psd.center_hz + psd.axis_hz0;
-  const hi = psd.center_hz + psd.axis_hz1;
+  const a0 = psd.axis_hz0, aSpan = psd.axis_hz1 - psd.axis_hz0;
+  const lo = psd.center_hz + a0 + S.zoom.lo * aSpan;
+  const hi = psd.center_hz + a0 + S.zoom.hi * aSpan;
   let html = "";
   for (let i = 0; i <= 4; i++) {
     html += `<span>${FMT[S.band].axis(lo + ((hi - lo) * i) / 4)}</span>`;

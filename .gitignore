@@ -11,6 +11,8 @@ venv/
 *.raw
 scan_memory.json
 scan_memory_test.json
+bookmarks.json
+bookmarks_test.json
 
 # OS / editor
 .DS_Store

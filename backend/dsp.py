@@ -199,6 +199,98 @@ class WfmDemod:
         self._last = np.complex64(0)
 
 
+class CtcssDetector:
+    """Goertzel CTCSS tone decoder for the NBFM audio path.
+
+    Tapped AFTER the 3.4 kHz voice low-pass but BEFORE the 300 Hz high-pass:
+    the sub-audible tone (67-250.3 Hz) is modulated onto the carrier like any
+    other audio, so it survives FM demodulation and the voice LPF, but the
+    300 Hz high-pass that cleans up the voice band would erase it.
+
+    Three-part decision, evaluated on a 0.25 s sliding window:
+      * deviation estimate  2|X(f_t)|/N scaled to Hz (opens above ~150 Hz,
+        typical transmitter tone deviation is 300-500 Hz)
+      * energy concentration - the tone must dominate its +/-7 Hz neighbours
+        (rejects wobbly voice fundamentals that stray into the tone band)
+      * persistence - two consecutive windows before opening (~0.5 s),
+        one window below the close threshold to shut again
+    """
+
+    OPEN_DEV_HZ = 150.0
+    CLOSE_DEV_HZ = 100.0
+    MIN_TONE_RATIO = 1.8     # centre bin vs +/-7 Hz neighbour bins
+    NEIGHBOUR_HZ = 7.0
+
+    def __init__(self, fs=AUDIO_RATE, window_s=0.25):
+        self.fs = float(fs)
+        self.win_n = int(round(fs * window_s))
+        self.tone_hz = 0.0
+        self.dev_hz = 0.0        # estimated tone deviation (Hz)
+        self.ratio = 0.0         # centre vs neighbour bin magnitude
+        self.open = False
+        self._buf = np.zeros(0, dtype=np.float64)
+        self._kern = self._kern_lo = self._kern_hi = None
+        self._open_cnt = 0
+
+    def set_tone(self, hz):
+        """Select the tone to decode (Hz); 0 disables the detector."""
+        hz = float(hz or 0.0)
+        if hz == self.tone_hz:
+            return
+        self.tone_hz = hz
+        self._buf = np.zeros(0, dtype=np.float64)
+        self.open = False
+        self.dev_hz = 0.0
+        self.ratio = 0.0
+        self._open_cnt = 0
+        if hz > 0.0:
+            n = np.arange(self.win_n, dtype=np.float64)
+            base = -2j * np.pi * hz / self.fs
+            d = 2j * np.pi * self.NEIGHBOUR_HZ / self.fs
+            self._kern = np.exp(base * n)
+            self._kern_lo = np.exp((base - d) * n)
+            self._kern_hi = np.exp((base + d) * n)
+        else:
+            self._kern = self._kern_lo = self._kern_hi = None
+
+    def process(self, audio):
+        """Feed one block of pre-high-pass NBFM audio (48 kHz float)."""
+        if self._kern is None:
+            self.open = False
+            return
+        self._buf = np.concatenate(
+            (self._buf, np.asarray(audio, dtype=np.float64)))
+        if len(self._buf) < self.win_n:
+            return
+        if len(self._buf) > 2 * self.win_n:
+            self._buf = self._buf[-self.win_n:]
+        seg = self._buf[-self.win_n:]
+        mag = abs(np.dot(seg, self._kern))
+        nbr = (abs(np.dot(seg, self._kern_lo))
+               + abs(np.dot(seg, self._kern_hi)))
+        self.dev_hz = 2.0 * mag / self.win_n * NBFM_DEV_HZ
+        self.ratio = mag / (nbr + 1e-9)
+        stable = self.ratio >= self.MIN_TONE_RATIO
+        if self.open:
+            if self.dev_hz < self.CLOSE_DEV_HZ or not stable:
+                self.open = False
+                self._open_cnt = 0
+        elif self.dev_hz >= self.OPEN_DEV_HZ and stable:
+            self._open_cnt += 1
+            if self._open_cnt >= 2:      # two windows ~= 0.5 s persistence
+                self.open = True
+                self._open_cnt = 0
+        else:
+            self._open_cnt = 0
+
+    def reset(self):
+        self._buf = np.zeros(0, dtype=np.float64)
+        self.open = False
+        self.dev_hz = 0.0
+        self.ratio = 0.0
+        self._open_cnt = 0
+
+
 class NbfmDemod:
     """Narrowband FM for NOAA Weather Radio (5 kHz deviation, 25 kHz grid)."""
 
@@ -223,6 +315,8 @@ class NbfmDemod:
         self._agc = 0.3
         self.last_chan_db = None
         self._last = np.complex64(0)
+        # CTCSS tap: sees the sub-audible band the voice high-pass removes
+        self.ctcss = CtcssDetector(AUDIO_RATE)
 
     def process(self, raw):
         x = self.nco.process(raw)
@@ -237,6 +331,7 @@ class NbfmDemod:
         y = self.dec2.process(audio.astype(np.complex64))
         audio = y.real
         audio = signal.lfilter(self.lpf_b, 1.0, audio, zi=self.lpf_zi)[0]
+        self.ctcss.process(audio)   # sub-audible tap, before the 300 Hz HPF
         audio = signal.lfilter(self.hpf_b, self.hpf_a, audio,
                                zi=self.hpf_zi)[0]
         # slow AGC lifts typical voice levels toward ~0.7 FS
@@ -254,6 +349,9 @@ class NbfmDemod:
         self.hpf_zi[:] = 0
         self._agc = 0.3
         self._last = np.complex64(0)
+        tone = self.ctcss.tone_hz
+        self.ctcss = CtcssDetector(AUDIO_RATE)
+        self.ctcss.set_tone(tone)
 
 
 class AmDemod:

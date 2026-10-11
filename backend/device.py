@@ -110,7 +110,11 @@ class SimDevice:
 
     RDS_PI = 0x2A5B
     RDS_PS = "SIM-RDS"
-    RDS_RT = "RTL-SDR Player 1.1 - RDS ok - USA 75us deemph"
+    RDS_RT = "RTL-SDR Player 1.3 - RDS ok - USA 75us deemph"
+
+    # CTCSS tone (Hz) carried by each simulated NBFM station, at the typical
+    # 350 Hz tone deviation. Lets the CTCSS squelch be exercised end-to-end.
+    NBFM_TONES = {162_400_000: 123.0, 162_550_000: 141.3}
 
     def __init__(self):
         self.center = 98.3e6
@@ -198,9 +202,14 @@ class SimDevice:
                     va = np.conj(va)
                 sig = (va * np.exp(1j * two_pi * off * t)).astype(np.complex64)
             elif kind == "nbfm":
-                # +/-5 kHz deviation, integrated properly for the NBFM scale
+                # +/-5 kHz deviation, integrated properly for the NBFM scale,
+                # plus the station's CTCSS tone at 350 Hz deviation
                 acc = self._acc_for(freq)
-                c = np.cumsum(5000.0 * audio * lfo)
+                dev = 5000.0 * audio * lfo
+                tone_hz = self.NBFM_TONES.get(freq)
+                if tone_hz:
+                    dev = dev + 350.0 * np.sin(two_pi * tone_hz * t)
+                c = np.cumsum(dev)
                 ph = two_pi * off * t + acc[2] + two_pi * c / fs
                 acc[2] = (acc[2] + two_pi * float(c[-1]) / fs) % two_pi
                 sig = np.exp(1j * ph).astype(np.complex64)

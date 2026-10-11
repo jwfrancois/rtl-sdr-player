@@ -7,7 +7,7 @@ import json
 import os
 
 APP_NAME = "RTL-SDR Player"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -30,7 +30,17 @@ DEFAULTS = {
     "scan_dwell_s": 0.45,          # time spent per channel while scanning
     "scan_release_s": 2.5,         # squelch-closed time before hopping on
     "scan_memory_file": "scan_memory.json",
+    "bookmarks_file": "bookmarks.json",
 }
+
+# Standard EIA CTCSS (PL) tones in Hz — the sub-audible squelch tones used
+# on NBFM channels (NOAA-adjacent services, GMRS/MURS/ham repeaters).
+CTCSS_TONES = [
+    67.0, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, 94.8,
+    97.4, 100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3, 131.8,
+    136.5, 141.3, 146.2, 151.4, 156.7, 162.2, 167.9, 173.8, 179.9, 186.2,
+    192.8, 203.5, 210.7, 218.1, 225.7, 233.6, 241.8, 250.3,
+]
 
 # Band tables: frequency limits + tuning step per band. The demodulator is
 # chosen from the band, with an optional per-band mode override:

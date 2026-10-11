@@ -171,15 +171,93 @@ def main():
         eng2.close()
         print(f"  wx auto: {auto_ok}, back to wfm off: {auto_off_ok}")
 
+        print("== CTCSS detector (synthetic audio) ==")
+        fs_a = 48_000
+        det = dsp.CtcssDetector(fs_a)
+        tt = np.arange(int(fs_a * 1.2)) / fs_a
+        tone = (350.0 / 5_000.0) * np.sin(2 * np.pi * 123.0 * tt)
+        def feed(sig, hz):  # windowed-detector helper
+            det.set_tone(hz)
+            for i in range(0, len(sig), 5_242):
+                det.process(sig[i:i + 5_242])
+            return det
+        feed(tone, 123.0)
+        ct_ok = det.open
+        print(f"  123.0 Hz tone: open={det.open} dev={det.dev_hz:.0f} Hz")
+        feed(tone, 127.3)
+        ct_adj = not det.open and det.dev_hz < 60.0
+        print(f"  adjacent 127.3 selected: open={det.open} dev={det.dev_hz:.0f} Hz")
+        wob = 0.25 * np.sin(2 * np.pi * 130.0 * tt
+                            + 3.0 * np.sin(2 * np.pi * 3.0 * tt))
+        feed(wob, 123.0)
+        ct_wob = not det.open
+        print(f"  wobbly voice fundamental: open={det.open} ratio={det.ratio:.2f}")
+        feed(0.3 * np.sin(2 * np.pi * 500.0 * tt), 123.0)
+        ct_voice = not det.open
+        print(f"  voice above the tone band: open={det.open} dev={det.dev_hz:.0f} Hz")
+
+        print("== engine CTCSS gate: 162.550 carries 141.3 in the sim ==")
+        eng.tune(band="wx", freq_hz=162_550_000)
+        eng.set_squelch(-20.0)
+        eng.set_ctcss(123.0)          # wrong tone -> gate stays closed
+        time.sleep(1.6)
+        wrong = not eng._ctcss_open()
+        eng.set_ctcss(141.3)          # correct tone -> opens
+        time.sleep(1.6)
+        right = eng._ctcss_open()
+        eng.set_ctcss(0.0)
+        print(f"  wrong tone closed={wrong}, right tone open={right}")
+        try:
+            eng.set_ctcss(123.4)
+            ct_invalid = False
+        except ValueError:
+            ct_invalid = True
+        print(f"  invalid tone rejected={ct_invalid}")
+
+        print("== bookmarks: add / list / persist / delete ==")
+        conf["bookmarks_file"] = "bookmarks_test.json"
+        bmk_file = os.path.join(cfg.ROOT, conf["bookmarks_file"])
+        if os.path.exists(bmk_file):
+            os.remove(bmk_file)
+        beng = ReceiverEngine(conf, prefer_sim=True)   # loads bookmarks.json
+        beng.band, beng.freq = "wfm", 96_100_000
+        b1 = beng.add_bookmark("Sim RDS", band="wfm", freq_hz=96_100_000,
+                               mode="wfm")
+        b2 = beng.add_bookmark(None, band="wx", freq_hz=162_550_000,
+                               mode="nbfm")
+        beng.add_bookmark("dup test", band="wfm", freq_hz=96_100_000)
+        lst = beng.bookmarks_list()
+        print("  list:", [(b["name"], b["band"], b["freq_hz"]) for b in lst])
+        # re-adding the same (band, freq) refreshes name/mode instead of duping
+        dup_ok = (b1["name"] == "dup test" and b2["name"] == "162.550 MHz"
+                  and len(lst) == 2
+                  and lst[0]["freq_hz"] <= lst[1]["freq_hz"])
+        del_ok = (beng.delete_bookmark(b1["id"])
+                  and len(beng.bookmarks_list()) == 1)
+        bmk_ok = dup_ok and del_ok
+        # persistence: a fresh engine (no start()) must see the surviving row
+        beng2 = ReceiverEngine(conf, prefer_sim=True)
+        bmk_persist = (len(beng2.bookmarks) == 1
+                       and beng2.bookmarks[0]["freq_hz"] == 162_550_000)
+        print(f"  roundtrip ok={bmk_ok}, persisted reload ok={bmk_persist}")
+        if os.path.exists(bmk_file):
+            os.remove(bmk_file)
+
         if os.path.exists(mem_file):
             os.remove(mem_file)
 
         ok = (rds_ok and sq_ok and scan_ok and ssb_ok and mem_ok
-              and smart_ok and mem_cleared and auto_ok and auto_off_ok)
+              and smart_ok and mem_cleared and auto_ok and auto_off_ok
+              and ct_ok and ct_adj and ct_wob and ct_voice
+              and wrong and right and ct_invalid
+              and bmk_ok and bmk_persist)
         print("RESULT:", "PASS" if ok else
               f"FAIL (rds={rds_ok} squelch={sq_ok} scan={scan_ok} "
               f"ssb={ssb_ok} mem={mem_ok} smart={smart_ok} "
-              f"clear={mem_cleared} auto={auto_ok and auto_off_ok})")
+              f"clear={mem_cleared} auto={auto_ok and auto_off_ok} "
+              f"ctcss={ct_ok and ct_adj and ct_wob and ct_voice} "
+              f"gate={wrong and right and ct_invalid} "
+              f"bmk={bmk_ok and bmk_persist})")
         return 0 if ok else 1
     finally:
         eng.close()

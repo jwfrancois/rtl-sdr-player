@@ -10,6 +10,13 @@ v1.1 additions:
   * channel-power squelch with a soft tail, reported to the UI
   * a scanner that hops a channel list, holds on squelch-opening activity
     and logs what it found
+
+v1.3 additions:
+  * CTCSS tone squelch on the NBFM path (two-stage gate: carrier power
+    AND the selected sub-audible tone; the scanner only holds on
+    tone-matching channels)
+  * SDR#-style bookmarks: named band/freq/mode memories persisted to
+    bookmarks.json
 """
 import json
 import os
@@ -57,11 +64,22 @@ class ReceiverEngine:
         self._sq_user = False           # user has taken squelch control
         self.chan_db = None             # live channel-power reading
 
+        # CTCSS tone squelch (NBFM only): 0 disables, else a cfg.CTCSS_TONES
+        self.ctcss_hz = 0.0
+
         # station/scan memory: {"freqs": {hz_str: {hz, hits, last}}}
         self._mem_path = os.path.join(cfg.ROOT,
                                       conf.get("scan_memory_file",
                                                "scan_memory.json"))
         self.memory = self._load_memory()
+
+        # SDR#-style bookmarks: [{id, name, band, freq_hz, mode, added}]
+        self._bmk_path = os.path.join(cfg.ROOT,
+                                      conf.get("bookmarks_file",
+                                               "bookmarks.json"))
+        self.bookmarks = self._load_bookmarks()
+        self._bmk_seq = max([int(b.get("id", 0)) for b in self.bookmarks],
+                            default=0)
 
         # scanner state
         self._scan = {
@@ -134,6 +152,26 @@ class ReceiverEngine:
         with self._lock:
             self.squelch_db = None if db in (None, "off") else float(db)
             self._sq_user = True   # user decision beats band defaults
+
+    def set_ctcss(self, hz):
+        """CTCSS tone squelch for NBFM (Hz; 0 = carrier squelch only).
+
+        Selecting a tone implies squelch on: the tone gate sits behind the
+        channel-power gate, so it needs a carrier threshold to gate first.
+        """
+        hz = float(hz or 0.0)
+        if hz < 0:
+            raise ValueError("ctcss hz must be >= 0")
+        if hz and hz not in cfg.CTCSS_TONES:
+            raise ValueError(f"unknown CTCSS tone: {hz}")
+        with self._lock:
+            self.ctcss_hz = hz
+            if hz and self.squelch_db is None:
+                self.squelch_db = float(self.conf["squelch_default_db"])
+                self._sq_user = True
+            if self._demod is not None and hasattr(self._demod, "ctcss"):
+                self._demod.ctcss.set_tone(hz)
+        return hz
 
     def set_bfo(self, hz):
         """SSB clarifier offset (Hz); applied to the live demodulator."""
@@ -240,6 +278,82 @@ class ReceiverEngine:
             self._save_memory()
         return {"ok": True}
 
+    # ------------------------------------------------------------------
+    # bookmarks (SDR#-style named memories, persisted)
+    # ------------------------------------------------------------------
+    def _load_bookmarks(self):
+        try:
+            with open(self._bmk_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, list):
+                return [b for b in data
+                        if isinstance(b, dict) and "freq_hz" in b]
+        except (OSError, ValueError):
+            pass
+        return []
+
+    def _save_bookmarks(self):
+        try:
+            tmp = self._bmk_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.bookmarks, fh, indent=1)
+            os.replace(tmp, self._bmk_path)
+        except OSError:
+            pass  # bookmarks are a convenience; never break the capture loop
+
+    @staticmethod
+    def _default_bm_name(band, freq_hz):
+        if band == "am":
+            return f"{freq_hz / 1e3:.0f} kHz"
+        return f"{freq_hz / 1e6:.3f} MHz"
+
+    def add_bookmark(self, name=None, band=None, freq_hz=None, mode=None):
+        with self._lock:
+            band = band or self.band
+            if band not in cfg.BANDS:
+                raise ValueError(f"unknown band: {band}")
+            freq_hz = cfg.clamp_to_band(
+                int(freq_hz if freq_hz is not None else self.freq), band)
+            mode = mode or (self.demod_mode() if band == self.band else None)
+            if mode not in cfg.BANDS[band]["modes"]:
+                mode = None
+            # idempotent on (band, freq): refresh name/mode instead of dupes
+            for b in self.bookmarks:
+                if b["band"] == band and b["freq_hz"] == freq_hz:
+                    b["name"] = (name or b["name"]).strip()[:40]
+                    b["mode"] = mode or b.get("mode")
+                    self._save_bookmarks()
+                    return b
+            bm = {
+                "id": self._bmk_seq + 1,
+                "name": (str(name).strip() if name
+                         else self._default_bm_name(band, freq_hz))[:40],
+                "band": band,
+                "freq_hz": freq_hz,
+                "mode": mode,
+                "added": round(time.time(), 1),
+            }
+            self._bmk_seq = bm["id"]
+            self.bookmarks.append(bm)
+            if len(self.bookmarks) > 200:
+                self.bookmarks = self.bookmarks[-200:]
+            self._save_bookmarks()
+            return bm
+
+    def delete_bookmark(self, bm_id):
+        with self._lock:
+            before = len(self.bookmarks)
+            self.bookmarks = [b for b in self.bookmarks
+                              if b.get("id") != bm_id]
+            if len(self.bookmarks) != before:
+                self._save_bookmarks()
+                return True
+        return False
+
+    def bookmarks_list(self):
+        return sorted(self.bookmarks,
+                      key=lambda b: (b["band"], b["freq_hz"]))
+
     def subscribe(self):
         """Register an audio consumer. Each gets its own bounded queue so
         multiple browser tabs / reconnects never steal from each other."""
@@ -288,6 +402,20 @@ class ReceiverEngine:
         mode = self.mode or DEFAULT_MODE.get(self.band, self.band)
         return mode
 
+    def _ctcss_state(self):
+        """(dev_hz, open) from the live NBFM demodulator, or (None, False)."""
+        d = self._demod
+        if hasattr(d, "ctcss"):
+            return getattr(d.ctcss, "dev_hz", 0.0), bool(d.ctcss.open)
+        return None, False
+
+    def _ctcss_dev_hz(self):
+        st = self._ctcss_state()
+        return round(st[0], 1) if st[0] is not None else None
+
+    def _ctcss_open(self):
+        return self._ctcss_state()[1]
+
     def status(self):
         from . import tv
         with self._lock:
@@ -312,8 +440,13 @@ class ReceiverEngine:
                 "squelch_db": self.squelch_db,
                 "squelch_default_db": self.conf.get("squelch_default_db"),
                 "squelch_open": self.squelch_open,
+                "ctcss_hz": self.ctcss_hz,
+                "ctcss_tones": cfg.CTCSS_TONES,
+                "ctcss_dev_hz": self._ctcss_dev_hz(),
+                "ctcss_open": self._ctcss_open(),
                 "chan_db": self.chan_db,
                 "scan": self.scan_status(),
+                "bookmarks": self.bookmarks_list(),
                 "target_buffer_ms": int(self.conf["audio_target_buffer_s"] * 1000),
                 "started": self.started,
             }
@@ -341,8 +474,10 @@ class ReceiverEngine:
                                lo_offset_hz=self.conf["lo_offset_hz"],
                                channel_bw_hz=5_000)
         if self.band == "wx":
-            return dsp.NbfmDemod(self.conf["fm_sample_rate"],
-                                 self.conf["lo_offset_hz"])
+            d = dsp.NbfmDemod(self.conf["fm_sample_rate"],
+                              self.conf["lo_offset_hz"])
+            d.ctcss.set_tone(self.ctcss_hz)
+            return d
         return dsp.WfmDemod(self.conf["fm_sample_rate"],
                             self.conf["lo_offset_hz"],
                             self.conf["de_emphasis_us"])
@@ -476,10 +611,15 @@ class ReceiverEngine:
                     self.squelch_open = True
                     sq_open = True
 
-                # ---- scanner ----
-                muted = self._run_scanner(now, sq_open)
+                # ---- CTCSS tone gate (NBFM): carrier open AND tone match
+                eff_open = sq_open
+                if self.ctcss_hz > 0.0 and self.demod_mode() == "nbfm":
+                    eff_open = sq_open and self._ctcss_open()
+
+                # ---- scanner (holds must respect the full gate) ----
+                muted = self._run_scanner(now, eff_open)
                 # squelch gates audio on any band while enabled and closed
-                if self.squelch_db is not None and not sq_open:
+                if self.squelch_db is not None and not eff_open:
                     muted = True
                 if muted:
                     pcm = np.zeros_like(pcm)

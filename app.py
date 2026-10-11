@@ -86,6 +86,39 @@ async def api_squelch(body: dict):
     return {"ok": True, "squelch_db": engine.squelch_db}
 
 
+@app.post("/api/ctcss")
+async def api_ctcss(body: dict):
+    """CTCSS tone squelch for NBFM (Hz; 0 = off / carrier squelch only)."""
+    try:
+        hz = engine.set_ctcss(body.get("hz", 0))
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return {"ok": True, "ctcss_hz": hz}
+
+
+@app.get("/api/bookmarks")
+async def api_bookmarks():
+    return {"bookmarks": engine.bookmarks_list()}
+
+
+@app.post("/api/bookmarks")
+async def api_bookmarks_add(body: dict):
+    """Add a bookmark; omitting band/freq/mode bookmarks the current state."""
+    try:
+        bm = engine.add_bookmark(body.get("name"), band=body.get("band"),
+                                 freq_hz=body.get("freq_hz"),
+                                 mode=body.get("mode"))
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return {"ok": True, "bookmark": bm, "bookmarks": engine.bookmarks_list()}
+
+
+@app.post("/api/bookmarks/delete")
+async def api_bookmarks_delete(body: dict):
+    ok = engine.delete_bookmark(body.get("id"))
+    return {"ok": ok, "bookmarks": engine.bookmarks_list()}
+
+
 @app.post("/api/scan")
 async def api_scan(body: dict):
     action = (body.get("action") or "start").lower()
@@ -189,6 +222,9 @@ async def ws_spectrum(ws: WebSocket):
                     "scan": engine.scan_status(),
                     "squelch_db": engine.squelch_db,
                     "squelch_open": engine.squelch_open,
+                    "ctcss_hz": engine.ctcss_hz,
+                    "ctcss_dev_hz": engine._ctcss_dev_hz(),
+                    "ctcss_open": engine._ctcss_open(),
                     "chan_db": engine.chan_db,
                     **psd})
             await asyncio.sleep(0.1)

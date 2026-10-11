@@ -77,7 +77,32 @@ macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 
 ---
 
-## What's new in v1.2
+## What's new in v1.3
+
+- **CTCSS tone squelch (WX band)** — narrowband FM channels gain the classic
+  PL gate: pick one of the 38 standard EIA tones (67.0–250.3 Hz) in the CTC
+  dropdown and the audio only opens when the carrier *and* the matching
+  sub-audible tone are present. The decoder is a Goertzel filter tapped
+  before the voice high-pass, checks the tone's deviation (~150 Hz minimum),
+  its frequency stability against neighbouring bins (so wobbly voice
+  fundamentals don't false-trigger), and needs ~0.5 s of solid tone before
+  opening. The scanner respects it too: with a tone set, it only holds on
+  channels that carry *your* tone. The squelch badge shows `CTC 141.3 ✓`
+  when the tone locks.
+- **Waterfall zoom** — scroll the mouse wheel over the spectrum or waterfall
+  to zoom in around the cursor (up to ~50×, down to a ~50 kHz sliver),
+  double-click or the ⤢ button to reset, +/− buttons step in and out. The
+  zoom level shows in the spectrum header next to the visible span, the
+  frequency axis relabels itself, the waterfall crops to the same window,
+  and click-to-tune maps correctly at any zoom level. The zoom window
+  follows retunes within the band and resets on band change.
+- **SDR#-style bookmarks** — tune anywhere, press **+ Add** (name is
+  pre-filled with the frequency, edit it before Enter), and the station is
+  saved with its band and demod mode to `bookmarks.json`. Click a bookmark
+  to jump — the band, frequency *and* mode (e.g. USB) are all restored.
+  ✕ deletes. Bookmarks survive restarts and are shared across browser tabs.
+
+## What was new in v1.2
 
 - **SSB (USB/LSB) demodulation** — the AIR and AM bands gain single-sideband
   via a phasing demodulator (one-sided 300–3175 Hz voice bandpass on the
@@ -134,13 +159,18 @@ squelch doesn't chatter on marginal carriers.
 
 - **Spectrum**: the curve is the live band scan (2.4 MHz window). Peaks are
   stations. Click or drag anywhere to tune; the amber marker shows the tuned
-  frequency; the waterfall below shows history.
+  frequency; the waterfall below shows history. Wheel = zoom, double-click =
+  reset (see v1.3 above).
 - **Tuning**: arrows step by band (100 kHz FM / 10 kHz AM / 25 kHz WX+AIR);
   type a frequency and press Enter. FM shows MHz, AM shows kHz.
 - **Presets**: WX and AIR tabs show clickable channel chips (WX1–WX7, Guard,
   CTAF…). The active one is highlighted.
 - **Mode chips** (AIR/AM bands): AM / USB / LSB. In USB or LSB the BFO slider
   appears — drag to de-tune until voices sound natural, press **0** to reset.
+- **Bookmarks**: + Add saves the current band/frequency/mode under a name;
+  click a row to jump back, ✕ removes it.
+- **CTCSS** (WX band): the CTC dropdown under the LVL meter selects the tone
+  (or *CTCSS off* for plain carrier squelch).
 - **RDS panel** (FM tab): appears under the demod info line. PS name lights
   up first (it completes after all four 2-character segments arrive),
   RadioText and AF list follow. STEREO = 19 kHz pilot detected.
@@ -190,8 +220,8 @@ With no dongle present the app runs a synthetic RF spectrum so you can try
 everything: six FM stations (the one at **96.1 MHz carries a full RDS +
 stereo-pilot test signal** — PI `2A5B`, PS `SIM-RDS`), four AM stations,
 airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB) and 123.450
-(LSB)**, and NOAA voice on 162.400/162.550. Start it explicitly with
-`python app.py --sim`.
+(LSB)**, and NOAA voice on 162.400 (**CTCSS 123.0**) / 162.550 (**CTCSS
+141.3**). Start it explicitly with `python app.py --sim`.
 
 ## Configuration (`config.json`)
 
@@ -210,6 +240,7 @@ airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB) and 123.450
 | `scan_dwell_s` | 0.45 | Seconds spent per channel while hopping |
 | `scan_release_s` | 2.5 | Squelch-closed time before leaving a held channel |
 | `scan_memory_file` | scan_memory.json | Persisted scanner hit memory (smart sorting) |
+| `bookmarks_file` | bookmarks.json | Persisted SDR#-style bookmark list |
 
 ## Troubleshooting
 
@@ -233,11 +264,11 @@ airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB) and 123.450
 app.py               entry point (FastAPI + uvicorn)
 backend/config.py    defaults + band/preset/mode/scan tables
 backend/device.py    RTL-SDR driver layer + synthetic simulator (RDS + SSB test signals)
-backend/dsp.py       FM/AM/NBFM/SSB demodulation, pilot tracker, decimation, PSD
+backend/dsp.py       FM/AM/NBFM/SSB demodulation, CTCSS decoder, pilot tracker, decimation, PSD
 backend/rds.py       RDS decoder (Costas+Gardner+CRC) + test-signal encoder
-backend/stream.py    capture thread, tuning, squelch, scanner + memory, websocket streaming
+backend/stream.py    capture thread, tuning, squelch + CTCSS gate, scanner + memory, bookmarks, streaming
 backend/tv.py        DVB-T detection, channel scan, TS streaming (Linux)
-web/                 browser UI (spectrum, waterfall, RDS + scanner + memory panels)
+web/                 browser UI (spectrum + waterfall zoom, RDS, scanner, CTCSS, bookmarks)
 config.json          user settings
 setup.bat / run.bat  Windows helpers
 run.sh               Linux/macOS launcher
