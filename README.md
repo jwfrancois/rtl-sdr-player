@@ -39,13 +39,25 @@ Dongle → [this app] → http://localhost:8515
 > DVB-T TV receiver again you would re-run Zadig and pick the original
 > driver — see the TV section below.)
 
-**3. Get the native DLLs** — the app needs `rtlsdr.dll` and `libusb-1.0.dll`
-in the app folder:
+**3. Get the native DLLs** — the app needs `rtlsdr.dll` and `libusb-1.0.dll`,
+and since v1.3.1 it registers the app folder itself, so placing the files
+there is enough:
 
 - Download: <https://github.com/librtlsdr/librtlsdr/releases> (latest
   `win32-x64` zip) — or the RTL-SDR Blog driver release
   (<https://www.rtl-sdr.com/rtl-sdr-blog-v-3-downloads/>) which bundles the DLLs.
-- Copy both DLLs next to `app.py`.
+- Copy **both** DLLs into the folder that contains `app.py` (the `dlls\`
+  subfolder works too). They must match your Python's bitness: 64-bit Python
+  (the normal installer) needs the **x64** DLLs — 32-bit files fail with
+  *WinError 193*.
+- Verify with `python check_dlls.py` — it prints your Python's bitness, the
+  DLL architecture, whether Windows can actually load them, and the exact fix
+  when something is off.
+
+> Why "I copied them but it still errors" happened before v1.3.1: Python 3.8+
+> no longer searches an application's own folder when native DLLs are loaded.
+> The app now calls `os.add_dll_directory()` on the app folder at startup, so
+> the DLLs are found where the instructions said to put them.
 
 **4. Install and run:**
 
@@ -63,6 +75,16 @@ python app.py
 
 Then open **http://localhost:8515**.
 
+### Dongle vs simulation
+
+The app tries your dongle at startup; if it can't be opened it falls back to
+the **simulated spectrum** (the amber dot in the header). Since v1.3.1 the
+header pill has a switch button — click **Use dongle** to retry the hardware
+immediately (no restart needed), or **Simulation** to go back to the demo
+spectrum. If the dongle can't be opened, the status bar shows the exact
+reason (missing DLLs, wrong bitness, WinUSB driver not bound via Zadig, or
+another SDR program holding the stick).
+
 ## Setup (Linux)
 
 ```bash
@@ -76,6 +98,26 @@ macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 (radio works; TV does not).
 
 ---
+
+## What's new in v1.3.1
+
+- **The DLLs-in-the-app-folder fix** — on Python 3.8+, native DLLs dropped
+  next to `app.py` were silently invisible to `pyrtlsdr` (Windows stopped
+  searching the application folder years ago). The app now registers the
+  app folder (and its `dlls\` subfolder) with `os.add_dll_directory()` at
+  startup, so `rtlsdr.dll` + `libusb-1.0.dll` are finally found exactly
+  where step 3 says to put them.
+- **Precise DLL diagnostics** — when the dongle still can't open, the status
+  bar no longer guesses: it distinguishes *DLLs not found*, *wrong bitness*
+  (WinError 193 → "your DLLs are 32-bit but Python is 64-bit"), *missing
+  dependency* (WinError 126 → libusb), and *driver not bound* (Zadig).
+  `GET /api/device/dlls` returns the full report and **`check_dlls.py`**
+  (also run by `setup.bat`) prints it in the console.
+- **Dongle ↔ simulation switch button** — the header device pill gains a
+  small button: **Use dongle** retries the real RTL-SDR instantly (engine
+  hot-swap, no restart; audio clients re-subscribe automatically) and
+  **Simulation** returns to the synthetic demo spectrum. A failed switch
+  never takes the app down — it shows the reason instead.
 
 ## What's new in v1.3
 
@@ -247,7 +289,9 @@ airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB) and 123.450
 | Symptom | Fix |
 |---|---|
 | `Could not open the RTL2832U` | Zadig WinUSB driver not bound yet (step 2); or SDR#/SDR++ is open and holds the stick — close it |
-| `rtlsdr.dll not found` / pyrtlsdr import error | Copy `rtlsdr.dll` + `libusb-1.0.dll` next to `app.py` (step 3) |
+| `rtlsdr.dll not found` / DLL warning at the bottom | Copy `rtlsdr.dll` + `libusb-1.0.dll` next to `app.py` (step 3) and run `python check_dlls.py` — it names the exact problem (missing, wrong bitness, broken libusb) |
+| WinError 193 in the status bar | Your DLLs are 32-bit but Python is 64-bit — download the **x64** librtlsdr build and replace both DLLs |
+| Dongle won't switch on / falls back to simulation | Click **Use dongle** in the header; the status bar then shows the current reason (DLLs, Zadig driver, or stick busy) |
 | Device shows but tuning fails | Another process owns the stick; on Linux unload `dvb_usb_rtl28xxu` |
 | Strong distortion on FM | Lower the gain (dropdown) — signal overload |
 | No RDS on a known-RDS station | Check the STEREO flag: without the 19 kHz pilot there is no RDS; try a fixed gain or reposition the antenna |
@@ -262,6 +306,7 @@ airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB) and 123.450
 
 ```
 app.py               entry point (FastAPI + uvicorn)
+check_dlls.py        Windows DLL diagnostic (bitness, files, load test)
 backend/config.py    defaults + band/preset/mode/scan tables
 backend/device.py    RTL-SDR driver layer + synthetic simulator (RDS + SSB test signals)
 backend/dsp.py       FM/AM/NBFM/SSB demodulation, CTCSS decoder, pilot tracker, decimation, PSD

@@ -63,6 +63,16 @@ function applyStatus(st) {
   dot.className = "dot " + (st.mode === "hardware" ? "hw" : "sim");
   $("device-name").textContent = st.device || "unknown device";
   S.deviceMode = st.mode;
+  const sw = $("device-switch");
+  if (st.mode === "hardware") {
+    sw.hidden = false;
+    sw.textContent = "Simulation";
+    sw.title = "Switch to the simulated spectrum (no dongle used)";
+  } else {
+    sw.hidden = false;
+    sw.textContent = "Use dongle";
+    sw.title = "Retry the real RTL-SDR dongle now";
+  }
   S.gains = st.gains || [];
   S.targetMs = st.target_buffer_ms || 2500;
   S.presets = {};
@@ -154,8 +164,36 @@ async function pollStatus() {
   setInterval(refreshStatus, 8000);
 }
 
+// Toggle the receiver between the real dongle and the simulator without
+// restarting the app. On failure (dongle missing, DLLs still wrong) the
+// server answers 409 with the exact reason — show it in the status bar.
+async function switchDeviceMode() {
+  const btn = $("device-switch");
+  const target = S.deviceMode === "hardware" ? "sim" : "hardware";
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "…";
+  try {
+    const res = await fetch("/api/device/mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: target }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      $("stat-note").textContent = "⚠ " + (data.error || "switch failed");
+    }
+  } catch (e) {
+    $("stat-note").textContent = "⚠ switch failed: " + e;
+  }
+  btn.disabled = false;
+  btn.textContent = label;
+  await refreshStatus();
+}
+
 // ---------------------------------------------------------------- controls
 function wireControls() {
+  $("device-switch").addEventListener("click", switchDeviceMode);
   document.querySelectorAll(".tab").forEach((btn) => {
     btn.addEventListener("click", () => switchBand(btn.dataset.band));
   });

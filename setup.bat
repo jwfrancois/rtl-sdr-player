@@ -31,18 +31,9 @@ if errorlevel 1 (
 echo [ok] Python packages installed.
 
 REM --- 3. Native librtlsdr DLLs -----------------------------------------
-if exist rtlsdr.dll (
-    echo [ok] rtlsdr.dll found in this folder.
-) else (
-    echo.
-    echo [!] Native DLLs missing - two small files are needed:
-    echo.
-    echo     1. Go to:  https://github.com/librtlsdr/librtlsdr/releases
-    echo        download the newest  librtlsdr-win32-x64  zip  ^(or
-    echo        rel_with_dlls from the RTL-SDR Blog driver release^).
-    echo     2. Copy  rtlsdr.dll  and  libusb-1.0.dll  into this folder:
-    echo        %cd%
-    echo.
+python check_dlls.py
+if errorlevel 1 (
+    echo [!] Run "python check_dlls.py" again after fixing the items above.
 )
 
 REM --- 4. USB driver ------------------------------------------------------

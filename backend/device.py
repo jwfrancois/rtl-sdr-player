@@ -10,6 +10,8 @@ open_device() performs detection and never raises: it returns
 import math
 import os
 import platform
+import struct
+import sys
 import time
 
 import numpy as np
@@ -17,6 +19,52 @@ import numpy as np
 from . import rds as rds_mod
 
 IS_WINDOWS = platform.system() == "Windows"
+
+# --------------------------------------------------------------------------
+# Windows DLL discovery (THE fix for "DLLs are in the folder but not found")
+#
+# Since Python 3.8, ctypes no longer searches the application folder, the
+# current working directory or PATH when loading native DLLs. pyrtlsdr does
+# a bare `WinDLL("rtlsdr.dll")`, so DLLs dropped next to app.py are silently
+# invisible. Registering the app folder with os.add_dll_directory() (plus a
+# PATH prepend for good measure) makes "copy the DLLs into the app folder"
+# actually work on Python 3.8+.
+# --------------------------------------------------------------------------
+_HERE = os.path.dirname(os.path.abspath(__file__))          # backend/
+_APP_ROOT = os.path.dirname(_HERE)                          # folder w/ app.py
+_DLL_CANDIDATE_DIRS = (
+    _APP_ROOT,
+    os.path.join(_APP_ROOT, "dlls"),
+    os.path.join(_APP_ROOT, "drivers"),
+    _HERE,
+)
+_DLL_FILE_NAMES = ("rtlsdr.dll", "librtlsdr.dll", "libusb-1.0.dll")
+
+
+def _register_windows_dll_dirs():
+    """Register every candidate folder that actually contains a DLL.
+
+    Returns the os.add_dll_directory() handles (kept alive on module level
+    so the registrations last for the process lifetime).
+    """
+    handles = []
+    if not IS_WINDOWS:
+        return handles
+    for d in _DLL_CANDIDATE_DIRS:
+        try:
+            if not any(os.path.isfile(os.path.join(d, n))
+                       for n in _DLL_FILE_NAMES):
+                continue
+            handles.append(os.add_dll_directory(d))
+            # PATH prepend: pyrtlsdr also probes ctypes.util.find_library(),
+            # which walks PATH on Windows.
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+        except OSError:
+            pass
+    return handles
+
+
+_DLL_DIR_HANDLES = _register_windows_dll_dirs()
 
 
 # --------------------------------------------------------------------------
@@ -238,37 +286,133 @@ class SimDevice:
 # --------------------------------------------------------------------------
 # Detection
 # --------------------------------------------------------------------------
+def windows_dll_report():
+    """Diagnose the native librtlsdr situation (Windows only; {} elsewhere).
+
+    Reports which Python is running, where pyrtlsdr/rtlsdr.dll/libusb-1.0.dll
+    were found, and — most importantly — whether rtlsdr.dll itself can be
+    loaded by ctypes, with the exact WinError when it cannot. This turns the
+    vague "DLLs were not found" into an actionable answer (wrong bitness,
+    missing libusb, wrong folder, ...).
+    """
+    if not IS_WINDOWS:
+        return {}
+    import ctypes
+
+    rep = {
+        "python_bits": struct.calcsize("P") * 8,
+        "python_exe": sys.executable,
+        "pyrtlsdr": None,
+        "searched_dirs": list(_DLL_CANDIDATE_DIRS),
+        "rtlsdr_dll": None,
+        "libusb_dll": None,
+        "load_ok": False,
+        "winerror": None,
+        "message": None,
+    }
+
+    # rtlsdr.dll / libusb-1.0.dll: check our candidate folders + System32
+    system32 = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
+                            "System32")
+    for name, key in (("rtlsdr.dll", "rtlsdr_dll"),
+                      ("librtlsdr.dll", "rtlsdr_dll"),
+                      ("libusb-1.0.dll", "libusb_dll")):
+        if rep[key]:
+            continue
+        for d in _DLL_CANDIDATE_DIRS + (system32,):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                rep[key] = p
+                break
+
+    try:
+        import rtlsdr as _rtl
+        rep["pyrtlsdr"] = getattr(_rtl, "__version__", "installed")
+    except Exception as exc:  # not installed, or its own load failed
+        rep["pyrtlsdr"] = f"not usable ({exc})"
+
+    # Preflight: load rtlsdr.dll by absolute path and capture the real error
+    if rep["rtlsdr_dll"]:
+        try:
+            ctypes.WinDLL(rep["rtlsdr_dll"])
+            rep["load_ok"] = True
+        except OSError as exc:
+            rep["winerror"] = getattr(exc, "winerror", None)
+            rep["message"] = str(exc)
+    return rep
+
+
 def _import_error_hint():
-    if IS_WINDOWS:
+    if not IS_WINDOWS:
         return (
-            "pyrtlsdr is installed but the native librtlsdr DLLs were not found. "
-            "Copy rtlsdr.dll and libusb-1.0.dll into this app folder "
-            "(see README.md, step 2)."
+            "pyrtlsdr is installed but librtlsdr was not found. "
+            "Install it with your package manager, e.g. sudo apt install librtlsdr-dev rtl-sdr"
+        )
+
+    rep = windows_dll_report()
+    bits = rep["python_bits"]
+    folders = _DLL_CANDIDATE_DIRS[0]
+    if len(_DLL_CANDIDATE_DIRS) > 1:
+        folders += f" (or its {os.path.basename(_DLL_CANDIDATE_DIRS[1])}\\ subfolder)"
+
+    if rep["rtlsdr_dll"] is None:
+        return (
+            f"pyrtlsdr is installed but rtlsdr.dll was not found. Copy "
+            f"rtlsdr.dll and libusb-1.0.dll into {folders} — they must be "
+            f"{bits}-bit to match your Python (README.md, step 3; run "
+            f"check_dlls.py to verify)."
+        )
+    if rep["winerror"] == 193:
+        return (
+            f"rtlsdr.dll found at {rep['rtlsdr_dll']} but it is the wrong "
+            f"bitness for your {bits}-bit Python (WinError 193). Download the "
+            f"{bits}-bit (x64) librtlsdr build and replace both DLLs "
+            f"(README.md, step 3)."
+        )
+    if rep["winerror"] == 126:
+        return (
+            f"rtlsdr.dll found at {rep['rtlsdr_dll']} but a dependency is "
+            f"missing (WinError 126) — usually libusb-1.0.dll is absent or "
+            f"the wrong bitness. Put the {bits}-bit libusb-1.0.dll in the "
+            f"same folder as rtlsdr.dll."
+        )
+    if rep["load_ok"]:
+        return (
+            f"rtlsdr.dll at {rep['rtlsdr_dll']} loads standalone but pyrtlsdr "
+            f"still failed ({rep['message']}). Try: pip install --force-reinstall pyrtlsdr"
         )
     return (
-        "pyrtlsdr is installed but librtlsdr was not found. "
-        "Install it with your package manager, e.g. sudo apt install librtlsdr-dev rtl-sdr"
+        f"pyrtlsdr failed to load librtlsdr ({rep['message'] or 'unknown error'}). "
+        f"Run check_dlls.py in the app folder for a full diagnosis."
     )
 
 
 def open_device(prefer_sim=False):
-    """Returns (device, info). Never raises when sim_fallback is allowed."""
+    """Returns (device, info). Never raises when sim_fallback is allowed.
+
+    Import errors (pyrtlsdr / native DLLs missing) and device-open errors
+    (no dongle, driver not bound) are diagnosed separately so the user
+    gets the right fix in the status bar.
+    """
     from . import config as cfg
 
     if not prefer_sim:
         try:
-            dev = RtlSdrDevice(0)
-            info = {
-                "mode": "hardware",
-                "device": dev.name,
-                "backend": "pyrtlsdr / librtlsdr",
-                "note": "RTL2832U detected and streaming.",
-            }
-            return dev, info
-        except ImportError:
+            from rtlsdr import RtlSdr  # deferred import: friendly errors
+        except (ImportError, OSError):
             hint = _import_error_hint()
-        except Exception as exc:
-            hint = _usb_error_hint(exc)
+        else:
+            try:
+                dev = RtlSdrDevice(0)
+                info = {
+                    "mode": "hardware",
+                    "device": dev.name,
+                    "backend": "pyrtlsdr / librtlsdr",
+                    "note": "RTL2832U detected and streaming.",
+                }
+                return dev, info
+            except Exception as exc:
+                hint = _usb_error_hint(exc)
     else:
         hint = "Simulation mode requested."
 

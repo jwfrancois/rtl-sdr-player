@@ -48,6 +48,53 @@ async def api_status():
     return engine.status()
 
 
+# ----------------------------------------------------------------------
+# Device mode (hardware dongle <-> simulation)
+# ----------------------------------------------------------------------
+@app.post("/api/device/mode")
+async def api_device_mode(body: dict):
+    """Hot-swap the receiver between the real dongle and the simulator.
+
+    The new engine is built and started first; only if it really came up in
+    the requested mode does it replace the live one (the old engine keeps
+    running otherwise, so a failed switch never takes the app down).
+    """
+    global engine
+    want = (body.get("mode") or "").lower()
+    if want not in ("hardware", "sim"):
+        return JSONResponse(
+            {"ok": False, "error": "mode must be 'hardware' or 'sim'"},
+            status_code=400)
+    cur = engine
+    cur_hw = cur.info.get("mode") == "hardware"
+    if cur_hw == (want == "hardware"):
+        return {"ok": True, "mode": cur.info.get("mode"),
+                "device": cur.info.get("device"),
+                "note": "already in that mode"}
+
+    conf = config.load_config()
+    new = stream.ReceiverEngine(conf, prefer_sim=(want == "sim"))
+    new.start()
+    got_hw = new.info.get("mode") == "hardware"
+    if got_hw != (want == "hardware"):
+        # e.g. asked for hardware but the dongle/DLLs are not there
+        err = new.info.get("error") or "device not available"
+        new.close()
+        return JSONResponse({"ok": False, "error": err}, status_code=409)
+
+    engine = new          # atomic-ish swap: new handlers see the new engine
+    cur.close()
+    return {"ok": True, **{k: new.info.get(k) for k in
+                           ("mode", "device", "backend", "note")}}
+
+
+@app.get("/api/device/dlls")
+async def api_device_dlls():
+    """Windows DLL diagnostics: what was found where, with the exact error."""
+    from backend.device import windows_dll_report
+    return windows_dll_report()
+
+
 @app.post("/api/tune")
 async def api_tune(body: dict):
     try:
@@ -180,20 +227,26 @@ async def api_tv_stream():
 async def ws_audio(ws: WebSocket):
     await ws.accept()
     last_gen = -1
-    sub_id = engine.subscribe()
+    eng = engine                     # re-bound when the engine is hot-swapped
+    sub_id = eng.subscribe()
     await ws.send_json({
-        "event": "hello", "mode": engine.info.get("mode"),
-        "band": engine.band, "freq_hz": engine.freq,
-        "target_ms": int(engine.conf["audio_target_buffer_s"] * 1000),
+        "event": "hello", "mode": eng.info.get("mode"),
+        "band": eng.band, "freq_hz": eng.freq,
+        "target_ms": int(eng.conf["audio_target_buffer_s"] * 1000),
         "audio_rate": 48000,
     })
     try:
         while True:
-            gen = engine.current_gen()
-            chunks = engine.drain_sub(sub_id)
+            if engine is not eng:    # device mode switched: re-subscribe
+                eng.unsubscribe(sub_id)
+                eng = engine
+                sub_id = eng.subscribe()
+                last_gen = -1
+            gen = eng.current_gen()
+            chunks = eng.drain_sub(sub_id)
             if gen != last_gen:
                 await ws.send_json({"event": "reset",
-                                    "target_ms": int(engine.conf["audio_target_buffer_s"] * 1000)})
+                                    "target_ms": int(eng.conf["audio_target_buffer_s"] * 1000)})
                 last_gen = gen
             for chunk in chunks:
                 await ws.send_bytes(chunk.tobytes())
@@ -201,7 +254,7 @@ async def ws_audio(ws: WebSocket):
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
-        engine.unsubscribe(sub_id)
+        eng.unsubscribe(sub_id)
 
 
 @app.websocket("/ws/spectrum")

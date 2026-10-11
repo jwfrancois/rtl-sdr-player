@@ -10,11 +10,15 @@ Boots the app in sim mode on a test port and verifies:
 """
 import asyncio
 import json
+import os
 import sys
 import time
 import urllib.request
 
 import websockets
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from backend import config as cfg  # noqa: E402
 
 BASE = "http://127.0.0.1:8531"
 WS = "ws://127.0.0.1:8531"
@@ -69,7 +73,7 @@ async def main():
     # ---- 1. status ----
     st = rest("/api/status")
     st_bands_wx_presets = st["bands"]["wx"]["presets"]
-    check("status version 1.3.0", st["version"] == "1.3.0", st["version"])
+    check("status version", st["version"] == cfg.VERSION, st["version"])
     check("region US", st.get("region") == "US")
     check("de-emphasis 75 us", st.get("de_emphasis_us") == 75)
     check("bands wx+air present", "wx" in st["bands"] and "air" in st["bands"])
@@ -331,6 +335,34 @@ async def main():
     except urllib.error.HTTPError as exc:
         check("invalid mode rejected", exc.code == 400, f"HTTP {exc.code}")
     rest("/api/tune", {"band": "wfm", "freq_hz": 99_900_000})
+
+    # ---- 9. device mode API (v1.3.1) ----
+    dll = rest("/api/device/dlls")
+    check("dll report is a dict", isinstance(dll, dict), type(dll).__name__)
+    # already-sim -> asking for sim again succeeds without a swap
+    r = rest("/api/device/mode", {"mode": "sim"})
+    check("mode sim -> sim is a no-op", r.get("ok") is True, str(r))
+    # asking for hardware in a dongle-less environment must fail SAFELY:
+    # HTTP 409 + reason, and the app must still be alive in sim afterwards
+    try:
+        r = rest("/api/device/mode", {"mode": "hardware"})
+        sw_ok = r.get("ok") is True and r.get("mode") == "hardware"
+        check("hardware switch (dongle present?)", sw_ok, str(r))
+        if sw_ok:  # a real dongle answered: put the sim back
+            rest("/api/device/mode", {"mode": "sim"})
+    except urllib.error.HTTPError as exc:
+        body = json.loads(exc.read())
+        check("hardware switch fails safely (409 + reason)",
+              exc.code == 409 and bool(body.get("error")),
+              f"HTTP {exc.code}: {body.get('error', '')[:60]}")
+    st = rest("/api/status")
+    check("app alive in sim after failed switch",
+          st.get("mode") == "sim", str(st.get("mode")))
+    try:
+        rest("/api/device/mode", {"mode": "banana"})
+        check("invalid mode rejected", False)
+    except urllib.error.HTTPError as exc:
+        check("invalid mode rejected", exc.code == 400, f"HTTP {exc.code}")
 
     print()
     if fails:
