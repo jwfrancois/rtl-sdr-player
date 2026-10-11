@@ -13,7 +13,8 @@ import time
 
 import numpy as np
 
-sys.path.insert(0, "/home/z/my-project/download/rtl-sdr-player")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.rds import RdsDecoder, RdsEncoder  # noqa: E402
 

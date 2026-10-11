@@ -1,2 +1,17 @@
-skills/
-node_modules/
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local runtime artifacts
+*.log
+*.wav
+*.raw
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
