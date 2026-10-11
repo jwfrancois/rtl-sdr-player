@@ -93,6 +93,34 @@ macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 
 ---
 
+## What's new in v1.4.0
+
+- **All-band sweep** — one "All bands" button sweeps every channel of the
+  bands you tick (FM 87.5–108, AM 530–1700 kHz, NOAA WX, airband
+  118–137 MHz — 1,091 channels in ~6–7 min, less for a single band),
+  measures RF channel power at each one and remembers every station above
+  the squelch threshold. Audio is muted while sweeping; your tuning is
+  restored afterwards. Optional frequency window (`from_hz`/`to_hz` in the
+  API) sweeps just a segment.
+- **20 named station presets** — a new STATIONS panel gives you 20 slots:
+  click tunes, right-click saves the current station, double-click
+  renames, "Fill from sweep" populates all 20 from the last sweep
+  (strongest first, adjacent-channel shoulders merged). Slots persist in
+  `stations.json`.
+- **Automatic station names** — FM stations are named from their RDS PS
+  broadcast (the sweep dwells up to ~3 s extra on hot FM channels to
+  decode it), NOAA channels get their standard WX1–WX7 names, known
+  airband channels keep their labels (GUARD, CTAF, UNICOM…), everything
+  else is named by frequency. You can always rename.
+- **Full-band scan lists** — the live (listen-and-hold) scanner gained
+  "Full FM broadcast sweep" and "Full AM sweep" lists alongside the
+  existing NOAA/airband ones.
+- **Better WFM signal metric** — FM channel power is now measured
+  pre-detection on the RF signal (like the NBFM/AM squelch metric) instead
+  of demodulated audio loudness, which depended on how loud the programme
+  happened to be. This is what the sweep scores and what the LVL meter
+  shows on the FM band.
+
 ## What's new in v1.3.5
 
 - **Choppy audio on real hardware fixed** — the old capture loop did the
@@ -264,6 +292,21 @@ squelch doesn't chatter on marginal carriers.
   type a frequency and press Enter. FM shows MHz, AM shows kHz.
 - **Presets**: WX and AIR tabs show clickable channel chips (WX1–WX7, Guard,
   CTAF…). The active one is highlighted.
+- **Stations (20 presets)**: your own bank of named stations. Click a slot
+  to tune, **right-click** to save the current station into it (named
+  automatically from RDS / the WX table), **double-click** to rename.
+  See the sweep below for the one-click way to fill all 20.
+- **Sweep (SCANNER panel, every band)**: tick the bands you want
+  (FM / AM / WX / AIR) and press **All bands**. The receiver visits every
+  channel, measures signal power, and decodes RDS names on hot FM
+  channels — progress shows in the panel and results appear as a list
+  (strongest first, click a row to tune). When it finishes, press
+  **Fill from sweep** in the STATIONS panel to write the top 20 into your
+  presets. Your tuning is restored after the sweep; the SQL slider doubles
+  as the sweep threshold.
+- **Live scanner**: pick a list (NOAA, key airband, full airband,
+  full FM, full AM) and press Scan — it hops and *holds* on active
+  channels (v1.1 behaviour), unlike the sweep which just measures.
 - **Mode chips** (AIR/AM bands): AM / USB / LSB. In USB or LSB the BFO slider
   appears — drag to de-tune until voices sound natural, press **0** to reset.
 - **Bookmarks**: + Add saves the current band/frequency/mode under a name;
@@ -316,11 +359,13 @@ scanning, and RDS-decoding FM.
 ## Simulation mode
 
 With no dongle present the app runs a synthetic RF spectrum so you can try
-everything: six FM stations (the one at **96.1 MHz carries a full RDS +
-stereo-pilot test signal** — PI `2A5B`, PS `SIM-RDS`), four AM stations,
-airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB) and 123.450
-(LSB)**, and NOAA voice on 162.400 (**CTCSS 123.0**) / 162.550 (**CTCSS
-141.3**). Start it explicitly with `python app.py --sim`.
+everything: six FM stations (the ones at **96.1 MHz `SIM-RDS`** and
+**101.7 MHz `JAZZ-FM`** carry full RDS + stereo-pilot test signals), four
+AM stations, airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB)
+and 123.450 (LSB)**, and NOAA voice on 162.400 (**CTCSS 123.0**) / 162.550
+(**CTCSS 141.3**). Start it explicitly with `python app.py --sim`.
+Try the v1.4 flow in sim: SWEEP → All bands (a few minutes) →
+Fill from sweep → your 20 presets fill with named stations.
 
 ## Configuration (`config.json`)
 
@@ -338,8 +383,12 @@ airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB) and 123.450
 | `squelch_auto_bands` | {"wx": true, "air": true} | Bands that get squelch automatically on switch |
 | `scan_dwell_s` | 0.45 | Seconds spent per channel while hopping |
 | `scan_release_s` | 2.5 | Squelch-closed time before leaving a held channel |
+| `sweep_dwell_s` | 0.35 | Seconds spent per channel in the all-band sweep |
+| `sweep_rds_wait_s` | 3.0 | Extra dwell on hot FM channels while decoding the RDS name |
 | `scan_memory_file` | scan_memory.json | Persisted scanner hit memory (smart sorting) |
 | `bookmarks_file` | bookmarks.json | Persisted SDR#-style bookmark list |
+| `stations_file` | stations.json | Persisted 20-slot named station presets |
+| `sweep_results_file` | sweep_results.json | Persisted last sweep results (feeds Fill from sweep) |
 
 ## Troubleshooting
 

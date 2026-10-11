@@ -189,6 +189,88 @@ async def api_scan_memory():
     return {"memory": engine.memory_list(24)}
 
 
+# ----------------------------------------------------------------------
+# v1.4: all-band measurement sweep + 20 named station presets
+# ----------------------------------------------------------------------
+@app.post("/api/sweep")
+async def api_sweep(body: dict):
+    """Sweep every channel of the selected bands, measuring power and
+    (on FM) decoding RDS station names. body: {bands: [...],
+    threshold_db?, dwell_s?, from_hz?, to_hz?}."""
+    try:
+        res = engine.start_sweep(
+            bands=body.get("bands"),
+            threshold_db=(float(body["threshold_db"])
+                          if body.get("threshold_db") is not None else None),
+            dwell_s=(float(body["dwell_s"])
+                     if body.get("dwell_s") is not None else None),
+            from_hz=body.get("from_hz"), to_hz=body.get("to_hz"))
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return {"ok": True, **res, "scan": engine.scan_status()}
+
+
+@app.post("/api/sweep/stop")
+async def api_sweep_stop():
+    engine.stop_scan()
+    return {"ok": True, "scan": engine.scan_status()}
+
+
+@app.get("/api/sweep/results")
+async def api_sweep_results():
+    sc = engine.scan_status()
+    return {"running": bool(sc.get("running")),
+            "mode": sc.get("mode"), "state": sc.get("state"),
+            "idx": sc.get("idx", 0), "count": sc.get("count", 0),
+            "results": engine.sweep_results_list()}
+
+
+@app.get("/api/stations")
+async def api_stations():
+    return {"stations": engine.stations_list()}
+
+
+@app.post("/api/stations")
+async def api_stations_save(body: dict):
+    """Save/rename a station slot: {slot, name?, band?, freq_hz?, mode?}.
+    Omitting band/freq saves the current tuning (or renames the slot when
+    only a name is given)."""
+    try:
+        st = engine.set_station(body.get("slot"), name=body.get("name"),
+                                band=body.get("band"),
+                                freq_hz=body.get("freq_hz"),
+                                mode=body.get("mode"))
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return {"ok": True, "station": st, "stations": engine.stations_list()}
+
+
+@app.post("/api/stations/delete")
+async def api_stations_delete(body: dict):
+    try:
+        ok = engine.clear_station(body.get("slot"))
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return {"ok": ok, "stations": engine.stations_list()}
+
+
+@app.post("/api/stations/clear")
+async def api_stations_clear():
+    return {"ok": True, **engine.clear_stations()}
+
+
+@app.post("/api/stations/fill")
+async def api_stations_fill(body: dict):
+    """Fill the 20 slots from the last sweep (strongest first,
+    adjacent-channel shoulders merged)."""
+    try:
+        picks = engine.fill_stations_from_sweep(count=body.get("count"))
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return {"ok": True, "filled": len(picks),
+            "stations": engine.stations_list()}
+
+
 @app.get("/api/tv/status")
 async def api_tv_status():
     return {"status": tv.status(), "channels": tv.list_channels(),

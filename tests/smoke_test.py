@@ -77,7 +77,9 @@ async def main():
     check("region US", st.get("region") == "US")
     check("de-emphasis 75 us", st.get("de_emphasis_us") == 75)
     check("bands wx+air present", "wx" in st["bands"] and "air" in st["bands"])
-    check("scan lists", set(st["scan_lists"]) == {"noaa", "air_key", "air_band"})
+    check("scan lists",
+          set(st["scan_lists"]) == {"noaa", "air_key", "air_band",
+                                     "fm_band", "am_band"})
     check("wx presets", len(st["bands"]["wx"]["presets"]) == 7)
     check("air modes am/usb/lsb",
           st["bands"]["air"]["modes"] == ["am", "usb", "lsb"])
@@ -363,6 +365,57 @@ async def main():
         check("invalid mode rejected", False)
     except urllib.error.HTTPError as exc:
         check("invalid mode rejected", exc.code == 400, f"HTTP {exc.code}")
+
+    # ---- 10. all-band sweep + 20 station presets (v1.4) ----
+    r = rest("/api/sweep", {"bands": ["wfm"], "from_hz": 95_900_000,
+                            "to_hz": 96_300_000, "dwell_s": 0.2})
+    check("segment sweep starts", r.get("ok") is True
+          and r.get("channels") == 5, str(r.get("channels")))
+    deadline = time.time() + 25
+    sr = rest("/api/sweep/results")
+    while time.time() < deadline and sr.get("running"):
+        await asyncio.sleep(0.4)
+        sr = rest("/api/sweep/results")
+    results = sr.get("results", [])
+    hit = next((x for x in results if x["freq_hz"] == 96_100_000), None)
+    check("sweep completes, station found (shoulders merged)",
+          not sr.get("running") and len(results) == 1 and hit is not None,
+          str([(x["freq_hz"], x["db"]) for x in results]))
+    check("sweep auto-names via RDS",
+          bool(hit) and hit["name"] == "SIM-RDS",
+          str(hit and hit["name"]))
+    r = rest("/api/stations/fill", {})
+    check("fill presets from sweep", r.get("ok") is True
+          and r.get("filled") == 1 and r["stations"][0]["name"] == "SIM-RDS"
+          and sum(1 for s in r["stations"] if s) == 1, str(r.get("filled")))
+    st = rest("/api/status")
+    check("status carries 20 slots", len(st.get("stations", [])) == 20)
+    r = rest("/api/stations", {"slot": 3, "band": "wfm",
+                               "freq_hz": 96_100_000})
+    check("save station (live RDS name)", r.get("ok") is True
+          and r["station"]["name"] == "SIM-RDS",
+          str(r.get("station", {}).get("name")))
+    r = rest("/api/stations", {"slot": 3, "name": "My RDS"})
+    check("rename station", r.get("ok") is True
+          and r["station"]["name"] == "My RDS")
+    r = rest("/api/stations/delete", {"slot": 3})
+    check("delete station", r.get("ok") is True
+          and r["stations"][2] is None)
+    try:
+        rest("/api/stations", {"slot": 21})
+        check("bad slot rejected", False)
+    except urllib.error.HTTPError as exc:
+        check("bad slot rejected", exc.code == 400, f"HTTP {exc.code}")
+    r = rest("/api/stations/clear", {})
+    check("clear stations", r.get("ok") is True)
+    try:
+        rest("/api/sweep", {"bands": ["banana"]})
+        check("unknown sweep band rejected", False)
+    except urllib.error.HTTPError as exc:
+        check("unknown sweep band rejected", exc.code == 400,
+              f"HTTP {exc.code}")
+    r = rest("/api/sweep/stop", {})
+    check("sweep stop when idle ok", r.get("ok") is True)
 
     print()
     if fails:

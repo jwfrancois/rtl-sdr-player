@@ -27,6 +27,10 @@ const S = {
   offline: false,           // /api/status unreachable -> banner + fast polling
   audioBackoff: 2500,       // WS retry delays grow while the server is down
   specBackoff: 2500,
+  stations: [],             // 20 named station slots (server-persisted)
+  stationsJson: "",         // change detection against /api/status
+  sweepResults: [],         // last all-band sweep (strongest first)
+  sweepFetchT: 0,           // throttle for results polling while sweeping
 };
 
 const $ = (id) => document.getElementById(id);
@@ -50,6 +54,7 @@ async function boot() {
   initAudio().catch((e) => console.warn("audio init deferred:", e));
   pollStatus();
   refreshBookmarks();
+  refreshSweepResults();     // last sweep survives server restarts
 }
 
 async function refreshStatus() {
@@ -185,6 +190,14 @@ function applyStatus(st) {
   $("stat-buffer").textContent = S.node
     ? $("stat-buffer").textContent  // live reading comes from the worklet
     : (S.targetMs / 1000).toFixed(1) + " s target";
+
+  // v1.4: the 20 station slots (re-render only when something changed)
+  const stJson = JSON.stringify(st.stations || []);
+  if (stJson !== S.stationsJson) {
+    S.stationsJson = stJson;
+    S.stations = st.stations || [];
+    renderStations();
+  }
 }
 
 async function pollStatus() {
@@ -326,6 +339,57 @@ function wireControls() {
       body: JSON.stringify({ hz: parseFloat(e.target.value) }) });
   });
 
+  // ---- stations (20 named presets) ----
+  $("st-fill").onclick = async () => {
+    const btn = $("st-fill");
+    btn.disabled = true; btn.textContent = "\u2026";
+    try {
+      const d = await (await fetch("/api/stations/fill", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      })).json();
+      if (d.ok) {
+        S.stations = d.stations;
+        S.stationsJson = JSON.stringify(d.stations);
+        renderStations();
+      } else {
+        $("stat-note").textContent = "\u26a0 " + (d.error || "fill failed");
+      }
+    } catch (e) { $("stat-note").textContent = "\u26a0 fill failed: " + e; }
+    btn.disabled = false; btn.textContent = "Fill from sweep";
+  };
+  $("st-clear").onclick = async () => {
+    try {
+      const d = await (await fetch("/api/stations/clear", { method: "POST" })).json();
+      if (d.ok) {
+        S.stations = [];
+        S.stationsJson = JSON.stringify(d.stations || []);
+        renderStations();
+      }
+    } catch { /* server gone; pollStatus will resync */ }
+  };
+
+  // ---- all-band sweep ----
+  $("sweep-btn").onclick = () => {
+    if (S.scanRunning && S.scanMode === "sweep") {
+      fetch("/api/sweep/stop", { method: "POST" });
+      return;
+    }
+    const bands = Array.from(document.querySelectorAll(".sweep-band:checked"))
+      .map((c) => c.value);
+    if (!bands.length) {
+      $("stat-note").textContent = "\u26a0 tick at least one band to sweep";
+      return;
+    }
+    fetch("/api/sweep", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bands,
+        threshold_db: parseFloat($("squelch").value) }),
+    }).then((r) => r.json()).then((d) => {
+      if (!d.ok) $("stat-note").textContent = "\u26a0 " + (d.error || "sweep failed");
+    }).catch(() => {});
+  };
+
   // ---- bookmarks ----
   $("bmk-add").onclick = () => {
     const row = $("bmk-add-row");
@@ -403,7 +467,7 @@ function renderPresets() {
 
 function updatePanelVisibility() {
   $("rds-panel").hidden = S.band !== "wfm";
-  $("scan-panel").hidden = !(S.band === "air" || S.band === "wx");
+  $("scan-panel").hidden = false;   // scanner + sweep live on every band
   $("ctcss-row").hidden = S.band !== "wx";   // CTCSS rides the NBFM path
 }
 
@@ -450,6 +514,15 @@ function updateReadout(freq) {
     const chips = document.querySelectorAll("#presets .chip");
     if (chips[hit]) chips[hit].classList.add("active");
   }
+  highlightStation();
+}
+
+function highlightStation() {
+  document.querySelectorAll("#st-grid .st-slot").forEach((el) => {
+    const st = (S.stations || [])[parseInt(el.dataset.slot, 10) - 1];
+    el.classList.toggle("active",
+      !!st && st.band === S.band && Math.abs(st.freq_hz - S.freq) < 500);
+  });
 }
 
 function tuneFromPixel(ev, immediate) {
@@ -647,8 +720,17 @@ function updateScan(ev) {
   const sc = ev.scan;
   if (!sc) return;
   S.scanRunning = !!sc.running;
+  S.scanMode = sc.mode || "live";
   const stateEl = $("scan-state");
-  if (!sc.running && sc.list == null) {
+  if (sc.running && sc.mode === "sweep") {
+    const pct = sc.count ? Math.round((sc.idx / sc.count) * 100) : 0;
+    stateEl.textContent = "sweeping " + (sc.idx + 1) + "/" + sc.count +
+      " (" + pct + "%)";
+    stateEl.className = "scan-state run";
+  } else if (!sc.running && sc.state === "done" && sc.mode === "sweep") {
+    stateEl.textContent = "sweep done \u00b7 " + (sc.results || 0) + " stations";
+    stateEl.className = "scan-state hold";
+  } else if (!sc.running && sc.list == null) {
     stateEl.textContent = "idle";
     stateEl.className = "scan-state";
   } else if (sc.running) {
@@ -664,7 +746,17 @@ function updateScan(ev) {
     stateEl.textContent = "stopped";
     stateEl.className = "scan-state";
   }
-  $("scan-btn").textContent = sc.running ? "Stop" : "Scan";
+  $("scan-btn").textContent = (sc.running && sc.mode !== "sweep") ? "Stop" : "Scan";
+  $("sweep-btn").textContent = (sc.running && sc.mode === "sweep") ? "Stop" : "All bands";
+
+  // while a sweep runs (and once right after it finishes), pull results
+  if (sc.mode === "sweep") {
+    const now = performance.now();
+    if (now - S.sweepFetchT > 2000) {
+      S.sweepFetchT = now;
+      refreshSweepResults();
+    }
+  }
 
   if (ev.chan_db != null) {
     const pct = Math.max(0, Math.min(100, ((ev.chan_db - -60) / 55) * 100));
@@ -760,6 +852,125 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[c]));
+}
+
+// ------------------------------------------------------------- stations (v1.4)
+const ST_BAND_LABEL = { wfm: "FM", am: "AM", wx: "WX", air: "AIR" };
+
+function stationFreqText(st) {
+  if (st.band === "am") return (st.freq_hz / 1e3).toFixed(0) + "k";
+  return (st.freq_hz / 1e6).toFixed(st.band === "wfm" ? 2 : 3);
+}
+
+function renderStations() {
+  const grid = $("st-grid");
+  if (!grid) return;
+  let html = "";
+  for (let i = 0; i < 20; i++) {
+    const st = (S.stations || [])[i];
+    if (st) {
+      html += '<button class="st-slot st-' + st.band + '" data-slot="' +
+        (i + 1) + '" title="' + escapeHtml(st.name) +
+        ' \u00b7 click: tune \u00b7 right-click: overwrite \u00b7 double-click: rename">' +
+        '<span class="st-num">' + (i + 1) + "</span>" +
+        '<span class="st-name">' + escapeHtml(st.name) + "</span>" +
+        '<span class="st-freq">' + stationFreqText(st) + "</span></button>";
+    } else {
+      html += '<button class="st-slot empty" data-slot="' + (i + 1) +
+        '" title="Empty slot \u2014 right-click to save the current station here">' +
+        '<span class="st-num">' + (i + 1) + "</span>" +
+        '<span class="st-name">&mdash;</span></button>';
+    }
+  }
+  grid.innerHTML = html;
+  grid.querySelectorAll(".st-slot").forEach((btn) => {
+    const slot = parseInt(btn.dataset.slot, 10);
+    const st = (S.stations || [])[slot - 1];
+    btn.onclick = () => {
+      if (st) {
+        S.mode = st.mode || null;      // restore the saved demodulator
+        tuneTo(st.band, st.freq_hz);
+      }
+    };
+    btn.oncontextmenu = (e) => {
+      e.preventDefault();
+      saveStationToSlot(slot);
+    };
+    btn.ondblclick = () => renameStation(slot);
+  });
+  highlightStation();
+}
+
+async function saveStationToSlot(slot) {
+  try {
+    const d = await (await fetch("/api/stations", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slot, band: S.band, freq_hz: S.freq,
+                             mode: S.mode }),
+    })).json();
+    if (d.ok) {
+      S.stations = d.stations;
+      S.stationsJson = JSON.stringify(d.stations);
+      renderStations();
+    } else {
+      $("stat-note").textContent = "\u26a0 " + (d.error || "save failed");
+    }
+  } catch (e) {
+    $("stat-note").textContent = "\u26a0 save failed: " + e;
+  }
+}
+
+async function renameStation(slot) {
+  const cur = (S.stations || [])[slot - 1];
+  const name = prompt("Station name:", cur ? cur.name : "");
+  if (name == null) return;
+  try {
+    const d = await (await fetch("/api/stations", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slot, name: name.trim() }),
+    })).json();
+    if (d.ok) {
+      S.stations = d.stations;
+      S.stationsJson = JSON.stringify(d.stations);
+      renderStations();
+    }
+  } catch { /* server gone; pollStatus will resync */ }
+}
+
+// ------------------------------------------------------------ sweep results
+async function refreshSweepResults() {
+  try {
+    const d = await (await fetch("/api/sweep/results")).json();
+    renderSweepResults(d.results || []);
+  } catch { /* server gone; pollStatus will resync */ }
+}
+
+function renderSweepResults(list) {
+  S.sweepResults = list || [];
+  const el = $("sweep-results");
+  if (!el) return;
+  if (!S.sweepResults.length) {
+    el.innerHTML = "";
+    return;
+  }
+  const rows = S.sweepResults.slice(0, 30).map((r) =>
+    '<div class="sweep-item" data-band="' + r.band + '" data-hz="' +
+    r.freq_hz + '">' +
+    '<span class="sr-name">' + escapeHtml(r.name || "?") + "</span>" +
+    '<span class="sr-band">' + (ST_BAND_LABEL[r.band] || r.band) + "</span>" +
+    '<span class="sr-freq">' +
+    (r.band === "am" ? (r.freq_hz / 1e3).toFixed(0) + "k"
+                     : (r.freq_hz / 1e6).toFixed(3)) + "</span>" +
+    '<span class="sr-db">' + (r.db != null ? r.db.toFixed(0) : "?") +
+    " dB</span></div>").join("");
+  el.innerHTML = '<div class="sweep-cap">SWEEP \u00b7 ' +
+    S.sweepResults.length + " stations (strongest 30)</div>" + rows;
+  el.querySelectorAll(".sweep-item").forEach((row) => {
+    row.onclick = () => {
+      S.mode = null;   // band default demodulator
+      tuneTo(row.dataset.band, parseInt(row.dataset.hz, 10));
+    };
+  });
 }
 
 // ---------------------------------------------------------------- spectrum

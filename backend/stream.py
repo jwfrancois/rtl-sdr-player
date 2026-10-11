@@ -94,12 +94,34 @@ class ReceiverEngine:
         self._bmk_seq = max([int(b.get("id", 0)) for b in self.bookmarks],
                             default=0)
 
+        # v1.4: the 20 named station presets ("STATIONS" panel). Each slot
+        # is {slot, name, band, freq_hz, mode} or None when empty.
+        self._st_path = os.path.join(cfg.ROOT,
+                                     conf.get("stations_file",
+                                              "stations.json"))
+        self.stations = self._load_stations()
+
+        # v1.4: last all-band sweep results (persisted, feeds "fill presets")
+        self._sweep_path = os.path.join(cfg.ROOT,
+                                        conf.get("sweep_results_file",
+                                                 "sweep_results.json"))
+        self.sweep_results = self._load_sweep_results()
+
         # scanner state
+        #   mode "live"  - hop/hold on squelch activity (v1.1 behaviour)
+        #   mode "sweep" - measure every channel across the selected bands,
+        #                  record power + RDS name, no holds, mute audio
+        # "chans" is a list of (band, freq_hz) tuples for both modes.
         self._scan = {
-            "running": False, "list": None, "idx": 0, "state": "scan",
+            "running": False, "list": None, "mode": "live", "label": None,
+            "idx": 0, "state": "idle",
             "freq_hz": None, "last_active_hz": None, "log": deque(maxlen=8),
             "hop_t": 0.0, "hop_gen": 0, "closed_t": None,
-            "freqs": [], "order": "linear",
+            "freqs": [], "chans": [], "order": "linear",
+            # sweep-only fields
+            "bands": [], "threshold_db": None, "dwell": 0.35,
+            "rds_wait": 1.6, "cur_db": None, "rds_name": None,
+            "restore": None, "t0": None,
         }
 
     # ------------------------------------------------------------------
@@ -137,7 +159,12 @@ class ReceiverEngine:
     def tune(self, band=None, freq_hz=None, mode=None):
         with self._lock:
             if self._scan["running"]:
-                self._scan["running"] = False  # manual tune wins over scanner
+                # manual tune wins over scanner/sweep; a sweep keeps the
+                # partial results but does not yank the tuner back
+                self._scan["running"] = False
+                self._scan["state"] = "idle"
+                if self._scan["mode"] == "sweep":
+                    self._close_sweep(save=True, restore=None)
             band = band or self.band
             if band not in cfg.BANDS:
                 raise ValueError(f"unknown band: {band}")
@@ -221,39 +248,113 @@ class ReceiverEngine:
                         for k, v in mem.items()}
                 freqs.sort(key=lambda f: (-rank.get(f, (0, 0.0))[0],
                                           -rank.get(f, (0, 0.0))[1]))
-            self._scan.update({
-                "running": True, "list": list_name, "idx": 0,
-                "state": "scan", "freq_hz": freqs[0],
-                "last_active_hz": None, "closed_t": None,
-                "hop_t": time.monotonic(), "hop_gen": self.gen + 1,
-                "freqs": freqs, "order": order,
-            })
-            self._pending = ("tune", entry["band"], freqs[0])
+            self._begin_scan(
+                mode="live", chans=[(entry["band"], f) for f in freqs],
+                list_name=list_name, label=entry.get("label", list_name),
+                order=order)
+            self._scan["threshold_db"] = (float(self.squelch_db)
+                                          if self.squelch_db is not None
+                                          else float(self.conf["squelch_default_db"]))
         return {"ok": True, "list": list_name, "order": order}
+
+    def start_sweep(self, bands=None, threshold_db=None, dwell_s=None,
+                    from_hz=None, to_hz=None):
+        """All-band measurement sweep (v1.4).
+
+        Tunes across every channel of the selected bands, records the peak
+        channel power and (on FM) the RDS station name of each hot channel,
+        then leaves a sorted result list behind for the STATIONS panel's
+        "fill presets" action. Audio is muted while sweeping; the previous
+        tuning is restored at the end (or on stop / manual tune).
+        """
+        req_bands = list(bands) if bands is not None \
+            else list(cfg.SWEEP_BAND_ORDER)
+        unknown = [b for b in req_bands if b not in cfg.BANDS]
+        if unknown:
+            raise ValueError(f"unknown sweep bands: {unknown}")
+        # keep the documented order, dropping bands the caller omitted
+        ordered = [b for b in cfg.SWEEP_BAND_ORDER if b in req_bands]
+        if not ordered:
+            raise ValueError("no valid bands to sweep")
+        chans = []
+        lo = int(from_hz) if from_hz is not None else None
+        hi = int(to_hz) if to_hz is not None else None
+        for band in ordered:
+            for f in cfg._band_channels(band):
+                if lo is not None and f < lo:
+                    continue
+                if hi is not None and f > hi:
+                    continue
+                chans.append((band, f))
+        if not chans:
+            raise ValueError("sweep range selects no channels")
+        with self._lock:
+            thr = (float(threshold_db) if threshold_db is not None
+                   else float(self.conf["squelch_default_db"]))
+            dwell = (float(dwell_s) if dwell_s is not None
+                     else float(self.conf["sweep_dwell_s"]))
+            dwell = max(0.12, min(2.0, dwell))
+            self._begin_scan(
+                mode="sweep", chans=chans, list_name=None,
+                label="Sweep: " + "+".join(
+                    cfg.BANDS[b]["label"] for b in ordered),
+                order="linear")
+            self._scan.update({
+                "bands": ordered, "threshold_db": thr, "dwell": dwell,
+                "rds_wait": float(self.conf["sweep_rds_wait_s"]),
+                "restore": (self.band, self.freq), "t0": time.time(),
+                "results": [],
+            })
+        return {"ok": True, "bands": ordered, "channels": len(chans),
+                "threshold_db": thr, "dwell_s": dwell}
+
+    def _begin_scan(self, mode, chans, list_name, label, order):
+        """Common scan/sweep setup (lock held by caller)."""
+        self._scan.update({
+            "running": True, "list": list_name, "mode": mode, "label": label,
+            "idx": 0, "state": "scan", "freq_hz": chans[0][1],
+            "last_active_hz": None, "closed_t": None,
+            "hop_t": time.monotonic(), "hop_gen": self.gen + 1,
+            "freqs": [f for _, f in chans], "chans": list(chans),
+            "order": order, "cur_db": None, "rds_name": None,
+        })
+        band0, freq0 = chans[0]
+        self._pending = ("tune", band0, freq0)
 
     def stop_scan(self):
         with self._lock:
+            if not self._scan["running"]:
+                self._scan["state"] = "idle"
+                return
+            was_sweep = self._scan["mode"] == "sweep"
+            restore = self._scan.get("restore") if was_sweep else None
             self._scan["running"] = False
             self._scan["state"] = "idle"
+            if was_sweep:
+                self._close_sweep(save=True, restore=restore)
 
     def scan_status(self):
         with self._lock:
             sc = self._scan
-            if not sc["running"] and sc["list"] is None:
-                return {"running": False}
-            entry = cfg.SCAN_LISTS.get(sc["list"], {})
+            if not sc["running"] and not sc["chans"]:
+                return {"running": False, "mode": sc["mode"],
+                        "results": len(sc.get("results", []))
+                        if sc["mode"] == "sweep" else 0}
             return {
                 "running": sc["running"],
                 "list": sc["list"],
-                "label": entry.get("label", sc["list"]),
+                "mode": sc["mode"],
+                "label": sc.get("label") or sc["list"] or "scan",
                 "idx": sc["idx"],
-                "count": len(sc["freqs"]),
+                "count": len(sc["chans"]),
                 "state": sc["state"],
                 "order": sc["order"],
                 "freq_hz": sc["freq_hz"],
                 "last_active_hz": sc["last_active_hz"],
                 "log": list(sc["log"]),
                 "memory": self.memory_list(),
+                "results": len(sc.get("results", [])),
+                "bands": sc.get("bands") or [],
             }
 
     # ------------------------------------------------------------------
@@ -374,6 +475,193 @@ class ReceiverEngine:
         return sorted(self.bookmarks,
                       key=lambda b: (b["band"], b["freq_hz"]))
 
+    # ------------------------------------------------------------------
+    # station presets: 20 named slots ("STATIONS" panel, v1.4)
+    # ------------------------------------------------------------------
+    NUM_STATIONS = 20
+
+    def _load_stations(self):
+        try:
+            with open(self._st_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, list) and len(data) == self.NUM_STATIONS:
+                return data
+        except (OSError, ValueError):
+            pass
+        return [None] * self.NUM_STATIONS
+
+    def _save_stations(self):
+        try:
+            tmp = self._st_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.stations, fh, indent=1)
+            os.replace(tmp, self._st_path)
+        except OSError:
+            pass  # presets are a convenience; never break the capture loop
+
+    def stations_list(self):
+        return list(self.stations)
+
+    def set_station(self, slot, name=None, band=None, freq_hz=None,
+                    mode=None):
+        """Save a station into slot 1..20. Omitting band/freq saves the
+        current tuning (naming it from live RDS when available); passing
+        only a name renames what is already in the slot."""
+        if not 1 <= int(slot) <= self.NUM_STATIONS:
+            raise ValueError(f"slot must be 1..{self.NUM_STATIONS}")
+        slot = int(slot)
+        with self._lock:
+            cur = self.stations[slot - 1]
+            if band is None and freq_hz is None and name:
+                # rename (keep the station already in the slot)
+                if cur is None:
+                    raise ValueError("empty slot: nothing to rename")
+                band, freq_hz = cur["band"], cur["freq_hz"]
+                mode = mode or cur.get("mode")
+            else:
+                band = band or self.band
+                if band not in cfg.BANDS:
+                    raise ValueError(f"unknown band: {band}")
+                freq_hz = cfg.clamp_to_band(
+                    int(freq_hz if freq_hz is not None else self.freq), band)
+                mode = mode or (self.demod_mode() if band == self.band
+                                else None)
+                if mode not in cfg.BANDS[band]["modes"]:
+                    mode = None
+            if not name:
+                # 1) live RDS identity - only valid for the channel that is
+                #    actually tuned right now
+                if band == self.band == "wfm" and freq_hz == self.freq:
+                    name = self._live_station_name()
+                # 2) a sweep that already identified this channel keeps
+                #    its name (right-click save after a sweep)
+                if not name:
+                    for r in self.sweep_results or []:
+                        if (r.get("band") == band
+                                and r.get("freq_hz") == freq_hz
+                                and r.get("name")):
+                            name = r["name"]
+                            break
+                name = name or self._default_station_name(band, freq_hz)
+            st = {"slot": slot, "name": str(name).strip()[:32] or "?",
+                  "band": band, "freq_hz": freq_hz, "mode": mode,
+                  "added": round(time.time(), 1)}
+            self.stations[slot - 1] = st
+            self._save_stations()
+            return st
+
+    def clear_station(self, slot):
+        if not 1 <= int(slot) <= self.NUM_STATIONS:
+            raise ValueError(f"slot must be 1..{self.NUM_STATIONS}")
+        with self._lock:
+            gone = self.stations[int(slot) - 1]
+            self.stations[int(slot) - 1] = None
+            self._save_stations()
+        return gone is not None
+
+    def clear_stations(self):
+        with self._lock:
+            self.stations = [None] * self.NUM_STATIONS
+            self._save_stations()
+        return {"ok": True}
+
+    def fill_stations_from_sweep(self, count=None):
+        """Populate the 20 slots from the last sweep results.
+
+        Strongest stations first, one per channel (adjacent-channel
+        shoulders are merged so one broadcast does not eat two slots).
+        Existing slot contents are overwritten.
+        """
+        results = [r for r in (self.sweep_results or [])
+                   if r.get("db") is not None]
+        if not results:
+            raise ValueError("no sweep results yet — run a sweep first")
+        count = int(count or self.NUM_STATIONS)
+        count = max(1, min(self.NUM_STATIONS, count))
+        picks = self._dedupe_results(results)[:count]
+        with self._lock:
+            self.stations = [None] * self.NUM_STATIONS
+            for i, r in enumerate(picks):
+                band = r["band"]
+                self.stations[i] = {
+                    "slot": i + 1,
+                    "name": (r.get("name")
+                             or self._default_station_name(band,
+                                                           r["freq_hz"]))[:32],
+                    "band": band,
+                    "freq_hz": int(r["freq_hz"]),
+                    "mode": r.get("mode"),
+                    "added": round(time.time(), 1),
+                }
+            self._save_stations()
+        return picks
+
+    @staticmethod
+    def _dedupe_results(results):
+        """Sort by power desc, then drop same-band neighbours within ~2
+        channel steps (a strong FM carrier also lights its neighbours)."""
+        step = {"wfm": 200_000, "am": 10_000, "wx": 25_000, "air": 25_000}
+        ordered = sorted(results, key=lambda r: -float(r["db"]))
+        picked = []
+        for r in ordered:
+            near = next((p for p in picked
+                         if p["band"] == r["band"]
+                         and abs(p["freq_hz"] - r["freq_hz"])
+                         < 1.9 * step.get(r["band"], 25_000)), None)
+            if near is None:
+                picked.append(r)
+        return picked
+
+    def sweep_results_list(self):
+        """Last sweep's results, strongest first, adjacent-channel
+        shoulders merged (one broadcast -> one row)."""
+        raw = [r for r in (self.sweep_results or [])
+               if r.get("db") is not None]
+        return self._dedupe_results(raw)
+
+    def _load_sweep_results(self):
+        try:
+            with open(self._sweep_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and isinstance(data.get("results"),
+                                                     list):
+                return data["results"]
+        except (OSError, ValueError):
+            pass
+        return []
+
+    def _save_sweep_results(self, meta):
+        try:
+            tmp = self._sweep_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"t": meta.get("t"), "bands": meta.get("bands"),
+                           "results": self.sweep_results}, fh, indent=1)
+            os.replace(tmp, self._sweep_path)
+        except OSError:
+            pass  # sweep results are a convenience; never break the loop
+
+    def _default_station_name(self, band, freq_hz):
+        """Sensible name when nothing better (RDS) is available."""
+        if band == "wfm":
+            return f"FM {freq_hz / 1e6:.1f}"
+        if band == "am":
+            return f"AM {freq_hz / 1e3:.0f}"
+        if band == "wx":
+            return "NOAA " + cfg.WX_NAMES.get(freq_hz,
+                                              f"{freq_hz / 1e6:.3f}")
+        if band == "air":
+            known = {p["hz"]: p["label"].split(" ", 1)[-1]
+                     for p in cfg.BANDS["air"]["presets"]}
+            return "AIR " + known.get(freq_hz, f"{freq_hz / 1e6:.3f}")
+        return f"{freq_hz / 1e6:.3f}"
+
+    def _live_station_name(self):
+        """The RDS PS of whatever is tuned right now (WFM only)."""
+        snap = self.current_rds()
+        if snap and snap.get("ps"):
+            return str(snap["ps"]).strip()[:32]
+        return None
+
     def subscribe(self):
         """Register an audio consumer. Each gets its own bounded queue so
         multiple browser tabs / reconnects never steal from each other."""
@@ -467,6 +755,7 @@ class ReceiverEngine:
                 "chan_db": self.chan_db,
                 "scan": self.scan_status(),
                 "bookmarks": self.bookmarks_list(),
+                "stations": self.stations_list(),
                 "target_buffer_ms": int(self.conf["audio_target_buffer_s"] * 1000),
                 "started": self.started,
                 "capture": {
@@ -538,24 +827,35 @@ class ReceiverEngine:
         self.gen += 1
 
     def _hop_scan(self):
-        """Advance the scanner to the next channel (lock held by caller)."""
+        """Advance the scanner/sweep to the next channel (lock held)."""
         sc = self._scan
-        entry = cfg.SCAN_LISTS[sc["list"]]
-        sc["idx"] = (sc["idx"] + 1) % len(sc["freqs"])
-        freq = sc["freqs"][sc["idx"]]
+        sc["idx"] += 1
+        if sc["idx"] >= len(sc["chans"]):
+            # list exhausted
+            if sc["mode"] == "sweep":
+                self._close_sweep(save=True,
+                                  restore=sc.get("restore"))
+                sc["running"] = False
+                sc["state"] = "done"
+                return
+            sc["idx"] = 0          # live scan wraps forever
+        band, freq = sc["chans"][sc["idx"]]
         sc["freq_hz"] = freq
         sc["state"] = "scan"
         sc["closed_t"] = None
         sc["hop_t"] = time.monotonic()
         sc["hop_gen"] = self.gen + 1
-        self._pending = ("tune", entry["band"], freq)
+        sc["cur_db"] = None
+        sc["rds_name"] = None
+        self._pending = ("tune", band, freq)
 
     def _run_scanner(self, now, sq_open):
-        """Scanner state machine; returns True when audio should be muted."""
+        """Scanner/sweep state machine; True when audio should be muted."""
         sc = self._scan
         if not sc["running"]:
             return False
-        entry = cfg.SCAN_LISTS[sc["list"]]
+        if sc["mode"] == "sweep":
+            return self._sweep_step(now)
         dwell = float(self.conf["scan_dwell_s"])
         release = float(self.conf["scan_release_s"])
         measured = self.gen >= sc["hop_gen"]
@@ -580,6 +880,70 @@ class ReceiverEngine:
         elif now - sc["closed_t"] >= release:
             self._hop_scan()
         return True  # squelch closed -> muted
+
+    def _sweep_step(self, now):
+        """One processed block in sweep mode (lock held by caller).
+
+        Tracks the peak channel power of the current channel, grabs the
+        RDS PS name while dwelling on a hot FM channel, records stations
+        above threshold, and hops onward at the configured pace.
+        """
+        sc = self._scan
+        if sc["idx"] >= len(sc["chans"]):
+            return False
+        band, _freq = sc["chans"][sc["idx"]]
+        # only measure after the hop's tune has actually been applied
+        # (gen reaches hop_gen): blocks still in flight from the previous
+        # channel would otherwise pollute the first measurement
+        if self.gen >= sc["hop_gen"] and self.chan_db is not None:
+            if sc["cur_db"] is None or self.chan_db > sc["cur_db"]:
+                sc["cur_db"] = float(self.chan_db)
+        hot = (sc["cur_db"] is not None
+               and sc["cur_db"] >= sc["threshold_db"])
+        if (hot and sc["rds_name"] is None and band == "wfm"):
+            snap = self.current_rds()
+            if snap and snap.get("ps"):
+                sc["rds_name"] = str(snap["ps"]).strip()[:32] or None
+        elapsed = now - sc["hop_t"]
+        # hold a little longer on a hot FM channel so the PS name arrives,
+        # but only when a stereo pilot is present (no pilot = no RDS at all)
+        has_pilot = (band == "wfm" and hasattr(self._demod, "pilot")
+                     and self._demod.pilot.present)
+        waiting_rds = (hot and band == "wfm" and has_pilot
+                       and sc["rds_name"] is None
+                       and elapsed < sc["dwell"] + sc["rds_wait"])
+        if elapsed < sc["dwell"] or waiting_rds:
+            return True                     # muted while sweeping
+        self._sweep_record(band, _freq)
+        self._hop_scan()
+        return True
+
+    def _sweep_record(self, band, freq):
+        sc = self._scan
+        db = sc.get("cur_db")
+        if db is None or db < sc["threshold_db"]:
+            return
+        rec = {
+            "band": band, "freq_hz": int(freq), "db": round(db, 1),
+            "name": sc.get("rds_name") or self._default_station_name(band, freq),
+            "mode": None,
+        }
+        results = sc.setdefault("results", [])
+        results.append(rec)
+        self._record_hit(freq)
+
+    def _close_sweep(self, save=True, restore=None):
+        """Finish a sweep: persist results, optionally restore tuning.
+        Called on natural completion, stop, and manual-tune interrupts
+        (lock held by caller)."""
+        sc = self._scan
+        results = sc.get("results") or []
+        if results:
+            self.sweep_results = results
+            self._save_sweep_results({"t": sc.get("t0") or time.time(),
+                                      "bands": sc.get("bands")})
+        if restore:
+            self._pending = ("tune", restore[0], restore[1])
 
     def _reader_loop(self):
         while not self._stop.is_set():

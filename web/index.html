@@ -68,6 +68,19 @@
 
       <div class="presets" id="presets"></div>
 
+      <div class="stations" id="stations-panel">
+        <div class="mem-head">
+          <span class="lbl">STATIONS (20)</span>
+          <span class="st-actions">
+            <button id="st-fill" class="btn btn-mini"
+                    title="Fill all 20 slots from the last band sweep (strongest first)">Fill from sweep</button>
+            <button id="st-clear" class="btn btn-mini" title="Empty all 20 slots">Clear</button>
+          </span>
+        </div>
+        <div class="st-grid" id="st-grid"></div>
+        <div class="st-hint">click: tune &middot; right-click: save current &middot; double-click: rename</div>
+      </div>
+
       <div class="bookmarks" id="bookmarks-panel">
         <div class="mem-head">
           <span class="lbl">BOOKMARKS</span>
@@ -136,6 +149,19 @@
           </select>
           <button id="scan-btn" class="btn btn-accent scan-btn">Scan</button>
         </div>
+        <div class="scan-row sweep-row">
+          <span class="lbl">SWEEP</span>
+          <span class="sweep-bands" id="sweep-bands">
+            <label><input type="checkbox" class="sweep-band" value="wfm" checked>FM</label>
+            <label><input type="checkbox" class="sweep-band" value="am" checked>AM</label>
+            <label><input type="checkbox" class="sweep-band" value="wx" checked>WX</label>
+            <label><input type="checkbox" class="sweep-band" value="air" checked>AIR</label>
+          </span>
+          <button id="sweep-btn" class="btn btn-mini btn-accent"
+                  title="Sweep every channel of the checked bands, measure power, decode RDS names — then use Fill from sweep">
+            All bands</button>
+        </div>
+        <div class="sweep-results" id="sweep-results"></div>
         <div class="scan-row sq-row">
           <span class="lbl">SQL</span>
           <input type="range" id="squelch" min="-60" max="-5" value="-30" step="1">

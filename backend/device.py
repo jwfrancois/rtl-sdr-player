@@ -178,7 +178,7 @@ class SimDevice:
     #   kind "ssbl" - LSB voice, carrier suppressed (conjugate envelope)
     STATIONS = [
         (88.5e6, 0.55, "wfm"), (92.3e6, 0.40, "wfm"),
-        (96.1e6, 0.72, "rds"),
+        (96.1e6, 0.72, "rds"), (101.7e6, 0.48, "rds"),
         (99.9e6, 0.50, "wfm"), (103.7e6, 0.62, "wfm"), (107.1e6, 0.34, "wfm"),
         (640e3, 0.50, "am"), (820e3, 0.66, "am"),
         (1010e3, 0.42, "am"), (1330e3, 0.56, "am"),
@@ -189,7 +189,14 @@ class SimDevice:
 
     RDS_PI = 0x2A5B
     RDS_PS = "SIM-RDS"
-    RDS_RT = "RTL-SDR Player 1.3 - RDS ok - USA 75us deemph"
+    RDS_RT = "RTL-SDR Player 1.4 - RDS ok - USA 75us deemph"
+
+    # Two FM stations carry RDS so the sweep's auto-naming can be verified
+    # end-to-end (each with its own PI/PS identity).
+    RDS_STATIONS = {
+        96_100_000: {"pi": 0x2A5B, "ps": "SIM-RDS", "pty": 9},
+        101_700_000: {"pi": 0x1F2C, "ps": "JAZZ-FM", "pty": 14},
+    }
 
     # CTCSS tone (Hz) carried by each simulated NBFM station, at the typical
     # 350 Hz tone deviation. Lets the CTCSS squelch be exercised end-to-end.
@@ -204,7 +211,20 @@ class SimDevice:
         self._rds = rds_mod.RdsEncoder(
             pi=self.RDS_PI, ps=self.RDS_PS, radiotext=self.RDS_RT,
             pty=9, ms=1, af_codes=(87, 124))  # 96.2 / 99.9 MHz alternates
+        # one encoder per RDS station (96.1 uses self._rds for compat)
+        self._rds_enc = {96_100_000: self._rds}
+        for hz, spec in self.RDS_STATIONS.items():
+            if hz not in self._rds_enc:
+                self._rds_enc[hz] = rds_mod.RdsEncoder(
+                    pi=spec["pi"], ps=spec["ps"], radiotext=spec["ps"],
+                    pty=spec["pty"], ms=1, af_codes=())
         self._acc = {}  # station freq -> [pilot phase acc, rds phase acc, nbfm acc]
+
+    def _rds_enc_for(self, freq):
+        enc = self._rds_enc.get(freq)
+        if enc is None:
+            enc = self._rds_enc[freq] = self._rds
+        return enc
 
     @property
     def name(self):
@@ -294,9 +314,10 @@ class SimDevice:
                 sig = np.exp(1j * ph).astype(np.complex64)
             elif kind == "rds":
                 # wfm music + 9% pilot + RDS subcarrier (DSB-SC, +/-2 kHz)
+                enc = self._rds_enc_for(freq)
                 acc = self._acc_for(freq)
                 cp = np.cumsum(6750.0 * np.sin(two_pi * 19000.0 * t))
-                cr = np.cumsum(self._rds.subcarrier_dev(t, 0.0))
+                cr = np.cumsum(enc.subcarrier_dev(t, 0.0))
                 ph = (two_pi * off * t + 5.2 * audio * lfo
                       + acc[0] + two_pi * cp / fs
                       + acc[1] + two_pi * cr / fs)

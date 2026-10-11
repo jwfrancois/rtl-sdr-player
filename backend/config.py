@@ -7,7 +7,7 @@ import json
 import os
 
 APP_NAME = "RTL-SDR Player"
-VERSION = "1.3.5"
+VERSION = "1.4.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -29,8 +29,12 @@ DEFAULTS = {
     # ^ NBFM/AM comm bands default to squelch ON (until the user takes over)
     "scan_dwell_s": 0.45,          # time spent per channel while scanning
     "scan_release_s": 2.5,         # squelch-closed time before hopping on
+    "sweep_dwell_s": 0.35,         # time spent per channel in the all-band sweep
+    "sweep_rds_wait_s": 3.0,       # extra dwell on hot FM channels for RDS PS
     "scan_memory_file": "scan_memory.json",
     "bookmarks_file": "bookmarks.json",
+    "stations_file": "stations.json",       # the 20 named station presets
+    "sweep_results_file": "sweep_results.json",
 }
 
 # Standard EIA CTCSS (PL) tones in Hz — the sub-audible squelch tones used
@@ -116,6 +120,12 @@ def _air_band_channels():
     return list(range(118_000_000, 136_975_000 + 1, 25_000))
 
 
+def _band_channels(band):
+    """Full band sweep at the band's tuning step (for the band scanner)."""
+    b = BANDS[band]
+    return list(range(b["lo_hz"], b["hi_hz"] + 1, b["step_hz"]))
+
+
 # Scanner channel lists
 SCAN_LISTS = {
     "noaa": {
@@ -133,7 +143,28 @@ SCAN_LISTS = {
         "band": "air",
         "freqs": _air_band_channels(),
     },
+    "fm_band": {
+        "label": "Full FM broadcast sweep 87.5-108 MHz",
+        "band": "wfm",
+        "freqs": _band_channels("wfm"),
+    },
+    "am_band": {
+        "label": "Full AM sweep 530-1700 kHz",
+        "band": "am",
+        "freqs": _band_channels("am"),
+    },
 }
+
+# Standard US NOAA Weather Radio channel names (162.550 = WX1 ... )
+WX_NAMES = {
+    162_550_000: "WX1", 162_400_000: "WX2", 162_475_000: "WX3",
+    162_425_000: "WX4", 162_450_000: "WX5", 162_500_000: "WX6",
+    162_525_000: "WX7",
+}
+
+# Sweep order used by the all-bands sweep: fast, high-value bands first so
+# the 20 station presets fill up quickly even on a partial sweep.
+SWEEP_BAND_ORDER = ["wfm", "am", "wx", "air"]
 
 
 def load_config():

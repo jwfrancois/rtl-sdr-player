@@ -13,6 +13,10 @@ scan_memory.json
 scan_memory_test.json
 bookmarks.json
 bookmarks_test.json
+stations.json
+stations_test.json
+sweep_results.json
+sweep_results_test.json
 
 # OS / editor
 .DS_Store

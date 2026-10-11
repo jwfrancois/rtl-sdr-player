@@ -173,6 +173,14 @@ class WfmDemod:
     def process(self, raw):
         x = self.nco.process(raw)
         x = self.dec1.process(x)
+        # channel-power metric: pre-detection RF power in the +/-120 kHz
+        # decimated window (v1.4). Demodulated AUDIO power depends on the
+        # station's deviation and even the current programme loudness, and
+        # off-channel filter skirts can read hotter than a quiet station —
+        # RF channel power is what "is someone broadcasting here" means,
+        # and it matches the NBFM/AM squelch metrics.
+        self.last_chan_db = 10.0 * float(np.log10(
+            np.mean(np.abs(x) ** 2) + 1e-12))
         # polar discriminator with 1-sample memory across blocks
         z = np.concatenate(([self._last], x))
         self._last = x[-1]
@@ -184,8 +192,6 @@ class WfmDemod:
         self.rds.process(d)
         audio = d * (self.IF_RATE / (2.0 * np.pi * WFM_DEV_HZ))
         y = self.dec2.process(audio.astype(np.complex64))
-        self.last_chan_db = 10.0 * float(np.log10(
-            np.mean(np.abs(y) ** 2) + 1e-12))
         audio = self.deemph.process(y.real.astype(np.float64))
         return to_int16(audio)
 
