@@ -27,6 +27,8 @@ class PcmPlayer extends AudioWorkletProcessor {
     this.carry = 0;
     this.lastStats = 0;
     this.volume = null;        // set via {type:"vol"}; falls back to the AudioParam
+    this.underruns = 0;        // diagnostic: playback starved while streaming
+    this.starved = false;
     this.port.onmessage = (e) => this.onMessage(e.data);
   }
 
@@ -62,7 +64,11 @@ class PcmPlayer extends AudioWorkletProcessor {
 
     if (!this.started) {
       if (this.fill >= target) this.started = true;
+    } else if (this.fill <= 1 && !this.starved) {
+      this.underruns++;        // playback ran dry while the stream was live
+      this.starved = true;
     }
+    if (this.fill > 128) this.starved = false;
 
     const n = out.length;
     if (!this.started || this.fill <= 1) {
@@ -90,7 +96,8 @@ class PcmPlayer extends AudioWorkletProcessor {
     const now = currentTime * 1000;
     if (now - this.lastStats > 300) {
       this.lastStats = now;
-      this.port.postMessage({ type: "stats", fillMs: (this.fill / sampleRate) * 1000 });
+      this.port.postMessage({ type: "stats", fillMs: (this.fill / sampleRate) * 1000,
+                              underruns: this.underruns });
     }
     return true;
   }

@@ -489,8 +489,10 @@ async function initAudio() {
   });
   S.node.port.onmessage = (e) => {
     if (e.data.type === "stats") {
-      $("stat-buffer").textContent =
-        (e.data.fillMs / 1000).toFixed(1) + " s / " + (S.targetMs / 1000).toFixed(1) + " s";
+      let txt = (e.data.fillMs / 1000).toFixed(1) + " s / "
+        + (S.targetMs / 1000).toFixed(1) + " s";
+      if (e.data.underruns > 0) txt += " · gaps " + e.data.underruns;
+      $("stat-buffer").textContent = txt;
     }
   };
   S.node.port.postMessage({ type: "cfg", targetMs: S.targetMs, ratio });

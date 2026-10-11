@@ -57,6 +57,19 @@ class ReceiverEngine:
         self._sub_seq = 0
         self.started = False
 
+        # v1.3.5: USB ingestion runs in its own thread so Python DSP time
+        # never eats into the realtime capture budget (the old serial loop
+        # consumed block_dur + dsp_time per block -> sustained deficit ->
+        # client jitter-buffer underruns -> choppy audio on real hardware).
+        self._reader = None
+        self._raw_q = deque()      # full IQ blocks waiting for the DSP thread
+        self._raw_max = 10         # ~1.1 s of headroom at 2.4 MSPS
+        self._pause_req = threading.Event()   # DSP asks the reader to park
+        self._parked = threading.Event()      # reader confirms it parked
+        self._resume = threading.Event()      # DSP releases the reader
+        self._residue = None        # partial (short) read accumulation
+        self.stats = {"usb_overflows": 0, "short_reads": 0, "dsp_ms": 0.0}
+
         # squelch (channel-power gate)
         self.squelch_db = None          # None -> squelch off
         self.squelch_open = True
@@ -101,13 +114,20 @@ class ReceiverEngine:
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name="sdr-capture")
+        self._reader = threading.Thread(target=self._reader_loop, daemon=True,
+                                        name="sdr-usb")
         self._thread.start()
+        self._reader.start()
         self.started = True
 
     def close(self):
         self._stop.set()
+        self._pause_req.clear()
+        self._resume.set()          # unblock a parked reader
         if self._thread:
             self._thread.join(timeout=2.0)
+        if self._reader:
+            self._reader.join(timeout=2.0)
         if self.device:
             self.device.close()
 
@@ -449,6 +469,12 @@ class ReceiverEngine:
                 "bookmarks": self.bookmarks_list(),
                 "target_buffer_ms": int(self.conf["audio_target_buffer_s"] * 1000),
                 "started": self.started,
+                "capture": {
+                    "usb_overflows": self.stats["usb_overflows"],
+                    "short_reads": self.stats["short_reads"],
+                    "dsp_ms": round(self.stats["dsp_ms"], 1),
+                    "queue_blocks": len(self._raw_q),
+                },
             }
             s["tv"] = tv.status()
             return s
@@ -555,6 +581,69 @@ class ReceiverEngine:
             self._hop_scan()
         return True  # squelch closed -> muted
 
+    def _reader_loop(self):
+        while not self._stop.is_set():
+            self._reader_step()
+
+    def _reader_step(self):
+        """One USB ingestion step (kept single-step so tests can drive it).
+
+        Blocks on device.read_iq() like before, but lives on its own thread:
+        librtlsdr's transfer ring stays continuously fed while the DSP thread
+        works, so Python processing time no longer subtracts from realtime.
+        Short reads are accumulated until a full block exists instead of
+        being thrown away (the old loop discarded up to half a block, which
+        audibly chopped the audio on real hardware).
+        """
+        if self._pause_req.is_set():
+            # retune in progress: park before touching the device again
+            self._parked.set()
+            self._resume.wait(timeout=0.25)   # poll so _stop still works
+            self._resume.clear()
+            return
+        try:
+            raw = self.device.read_iq(dsp.BLOCK)
+        except Exception as exc:
+            self.info["error"] = f"capture failed: {exc}"
+            time.sleep(0.3)
+            return
+        if self._pause_req.is_set():
+            return   # block captured at the old rate during a retune: discard
+        if not len(raw):
+            return   # device hiccup: nothing came out this time
+        if len(raw) < dsp.BLOCK:
+            self.stats["short_reads"] += 1
+            raw = raw if self._residue is None else \
+                np.concatenate((self._residue, raw))
+            self._residue = None
+            if len(raw) < dsp.BLOCK:
+                self._residue = raw
+                return
+        self._put_block(raw[:dsp.BLOCK])
+        if len(raw) > dsp.BLOCK:            # keep any surplus for next block
+            self._residue = raw[dsp.BLOCK:]
+        if not getattr(self.device, "is_real", True):
+            # simulator produces instantly: pace the reader to realtime so
+            # the queue/capacity stats stay meaningful and we don't spin
+            time.sleep(getattr(self, "_block_seconds", 0.109))
+
+    def _put_block(self, raw):
+        if len(self._raw_q) >= self._raw_max:
+            # brief yield first: lets a merely-busy DSP thread catch up
+            # without dropping (matters in sim, which produces instantly)
+            time.sleep(0.005)
+            if len(self._raw_q) < self._raw_max:
+                self._raw_q.append(raw)
+                return
+            # DSP is genuinely falling behind: drop the oldest block so
+            # latency stays bounded (counted in /api/status capture stats)
+            try:
+                self._raw_q.popleft()
+                self.stats["usb_overflows"] += 1
+            except IndexError:
+                pass
+        self._raw_q.append(raw)
+
     def _loop(self):
         psd_comp = dsp.PsdComputer()
         block_dur = self._block_seconds
@@ -568,7 +657,18 @@ class ReceiverEngine:
                 kind = pending[0]
                 try:
                     if kind == "tune":
-                        self._apply_tune(pending[1], pending[2])
+                        # sample rate / center freq change: park the USB
+                        # reader so it never reads across the reconfig
+                        self._pause_req.set()
+                        self._parked.clear()   # consume any stale flag
+                        self._parked.wait(timeout=1.5)
+                        try:
+                            self._apply_tune(pending[1], pending[2])
+                            self._raw_q.clear()
+                            self._residue = None
+                        finally:
+                            self._pause_req.clear()
+                            self._resume.set()
                     elif kind == "gain":
                         self.gain_db = pending[1]
                         self.device.set_gain(self.gain_db)
@@ -580,16 +680,12 @@ class ReceiverEngine:
                     time.sleep(0.2)
                     continue
 
-            # ---- capture + process ----
-            try:
-                raw = self.device.read_iq(dsp.BLOCK)
-            except Exception as exc:
-                self.info["error"] = f"capture failed: {exc}"
-                time.sleep(0.3)
+            # ---- process (blocks arrive from the sdr-usb thread) ----
+            if not self._raw_q:
+                time.sleep(0.004)
                 continue
-            if len(raw) < dsp.BLOCK // 2:
-                time.sleep(0.02)
-                continue
+            raw = self._raw_q.popleft()
+            t_dsp = time.monotonic()
             try:
                 pcm = self._demod.process(np.asarray(raw, dtype=np.complex64))
                 self.chan_db = getattr(self._demod, "last_chan_db", None)
@@ -628,11 +724,15 @@ class ReceiverEngine:
                     q.append(pcm)
                 self.psd = psd_comp.process(raw, self._fs, self._center,
                                             self.freq)
+                self.stats["dsp_ms"] = (
+                    0.9 * self.stats["dsp_ms"]
+                    + 0.1 * (time.monotonic() - t_dsp) * 1000.0)
             except Exception as exc:
                 self.info["error"] = f"dsp error: {exc}"
                 time.sleep(0.1)
 
-            # ---- pacing (only the simulator produces faster than real time) ----
+            # ---- pacing (keeps sim at realtime; on hardware the USB thread
+            # paces the capture side, this just avoids spinning) ----
             elapsed = time.monotonic() - t0
             if elapsed < block_dur:
                 time.sleep(block_dur - elapsed)

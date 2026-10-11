@@ -93,6 +93,25 @@ macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 
 ---
 
+## What's new in v1.3.5
+
+- **Choppy audio on real hardware fixed** — the old capture loop did the
+  USB read *and* all Python DSP serially, so every block took
+  `block_duration + dsp_time` to consume: a permanent ~15–30 % deficit
+  that slowly drained the player's 2.5 s jitter buffer and kept it
+  underrunning. USB ingestion now runs on its own thread that feeds a
+  bounded block queue; librtlsdr's transfer ring is never left starving,
+  and DSP time no longer subtracts from the realtime budget.
+- **Short USB reads are no longer thrown away** — the old loop discarded
+  up to half a block (≈ 55 ms of audio) whenever a read came back short;
+  partial reads now accumulate into the next full block.
+- **Retunes park the USB thread** through a clean handshake, so the
+  sample rate never changes mid-read.
+- **Audio-gap diagnostics** — the player counts underruns ("gaps N" in
+  the status bar) and `/api/status` now reports `capture` stats
+  (`usb_overflows`, `short_reads`, `dsp_ms`, `queue_blocks`), so a
+  remaining problem can be diagnosed from numbers instead of vibes.
+
 ## What's new in v1.3.4
 
 - **First-hardware-launch crash fixed** — with the dongle finally opening
@@ -339,6 +358,7 @@ airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB) and 123.450
 | Scanner never opens squelch | Raise the LVL bar reading above your SQL value by lowering SQL; check the antenna |
 | Scanner parks on noise | Raise SQL (more positive dB) |
 | No audio at all | Check the browser tab's autoplay block — click anywhere once, then reload |
+| Choppy / gappy audio | Fixed in v1.3.5 (USB reads moved to a dedicated thread) — update. Still gappy? Watch "gaps N" in the status bar, and `/api/status` → `capture`: rising `usb_overflows` = PC too slow (close heavy apps), rising `short_reads` = USB link trouble (use a rear USB 2.0 port, no hub) |
 | Everything noisy / ghost stations | Keep away from USB 3 ports and use a rear USB 2.0 port |
 | Heard a single tone on every frequency | You are in simulation mode (no dongle detected) — the app says so in the header |
 
