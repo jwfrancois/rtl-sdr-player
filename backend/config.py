@@ -7,7 +7,7 @@ import json
 import os
 
 APP_NAME = "RTL-SDR Player"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -24,13 +24,18 @@ DEFAULTS = {
     "sim_fallback": True,          # run in simulation mode when no dongle
     "lo_offset_hz": 250000,        # offset tuning: dodges the DC spike
     "squelch_default_db": -30,     # audio RMS gate used by the scanner
+    "squelch_hysteresis_db": 4.0,  # close threshold sits this far below open
+    "squelch_auto_bands": {"wx": True, "air": True},
+    # ^ NBFM/AM comm bands default to squelch ON (until the user takes over)
     "scan_dwell_s": 0.45,          # time spent per channel while scanning
     "scan_release_s": 2.5,         # squelch-closed time before hopping on
+    "scan_memory_file": "scan_memory.json",
 }
 
 # Band tables: frequency limits + tuning step per band. The demodulator is
-# chosen from the band: wfm -> wideband FM, wx -> narrowband FM,
-# am -> AM envelope (direct sampling), air -> AM envelope (offset tuned).
+# chosen from the band, with an optional per-band mode override:
+#   wfm -> wideband FM            wx -> narrowband FM
+#   am  -> AM envelope | USB/LSB  air -> AM envelope | USB/LSB
 BANDS = {
     "wfm": {
         "label": "FM",
@@ -38,6 +43,7 @@ BANDS = {
         "hi_hz": 108_000_000,
         "step_hz": 100_000,
         "desc": "Broadcast FM (wideband FM + RDS)",
+        "modes": ["wfm"],
         "presets": [],
     },
     "am": {
@@ -45,7 +51,8 @@ BANDS = {
         "lo_hz": 530_000,
         "hi_hz": 1_700_000,
         "step_hz": 10_000,
-        "desc": "Broadcast AM 530-1700 kHz (direct-sampling mode)",
+        "desc": "Broadcast AM 530-1700 kHz + shortwave-style SSB (direct sampling)",
+        "modes": ["am", "usb", "lsb"],
         "presets": [],
     },
     "wx": {
@@ -54,6 +61,7 @@ BANDS = {
         "hi_hz": 162_550_000,
         "step_hz": 25_000,
         "desc": "NOAA Weather Radio (narrowband FM, 5 kHz dev)",
+        "modes": ["nbfm"],
         "presets": [
             {"hz": 162550000, "label": "WX1"},
             {"hz": 162400000, "label": "WX2"},
@@ -69,7 +77,8 @@ BANDS = {
         "lo_hz": 118_000_000,
         "hi_hz": 136_975_000,
         "step_hz": 25_000,
-        "desc": "US airband 118-137 MHz (AM, 25 kHz channels)",
+        "desc": "US airband 118-137 MHz (AM, 25 kHz ch, SSB for mil/utility)",
+        "modes": ["am", "usb", "lsb"],
         "presets": [
             {"hz": 121500000, "label": "121.500 GUARD"},
             {"hz": 122000000, "label": "122.000 FSS"},

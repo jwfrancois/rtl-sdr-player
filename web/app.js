@@ -5,6 +5,7 @@
 const S = {
   band: "wfm",
   freq: 98300000,
+  mode: null,
   psd: null,
   gains: [],
   deviceMode: null,
@@ -93,14 +94,25 @@ function applyStatus(st) {
   $("band-desc").textContent = (st.bands?.[S.band]?.desc) || "";
   const deemph = st.de_emphasis_us || 75;
   const region = st.region || "US";
+  S.mode = st.demod_mode || S.mode;
   const demodLines = {
     wfm: `WFM mono · offset-tuned · de-emphasis ${deemph} µs (${region}) · RDS/RBDS`,
-    wx: "NBFM 5 kHz dev · NOAA Weather Radio · offset-tuned",
-    air: "AM envelope · US airband 25 kHz channels · offset-tuned",
+    wx: "NBFM 5 kHz dev · NOAA Weather Radio · offset-tuned · squelch auto",
+    air: "AM envelope · US airband 25 kHz channels · offset-tuned · squelch auto",
     am: "AM envelope · direct-sampling (Q input)",
+    usb: "SSB USB · phasing demod · 300–3175 Hz voice band · BFO clarifier",
+    lsb: "SSB LSB · phasing demod · 300–3175 Hz voice band · BFO clarifier",
   };
+  const lineKey = (S.mode === "usb" || S.mode === "lsb") ? S.mode : S.band;
   $("demod-line").textContent =
-    (demodLines[S.band] || S.band) + " · 2.4 MSPS capture";
+    (demodLines[lineKey] || S.band) + " · 2.4 MSPS capture";
+  renderModeRow(st);
+  const ssbNow = S.mode === "usb" || S.mode === "lsb";
+  $("bfo-row").hidden = !ssbNow;
+  if (typeof st.bfo_hz === "number" && document.activeElement !== $("bfo")) {
+    $("bfo").value = st.bfo_hz;
+    $("bfo-val").textContent = st.bfo_hz.toFixed(0) + " Hz";
+  }
   $("dn").title = "-" + (STEP[S.band] / 1e3).toFixed(0) + " kHz";
   $("up").title = "+" + (STEP[S.band] / 1e3).toFixed(0) + " kHz";
 
@@ -163,8 +175,32 @@ function wireControls() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "start",
                                list: $("scan-list").value,
+                               order: $("scan-order").value,
                                squelch_db: parseFloat($("squelch").value) }) });
     }
+  };
+  $("mem-clear").onclick = () => fetch("/api/scan", { method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "clear_memory" }) });
+
+  // SSB clarifier (BFO)
+  let bfoTimer = null;
+  $("bfo").addEventListener("input", (e) => {
+    const hz = parseInt(e.target.value, 10);
+    $("bfo-val").textContent = hz + " Hz";
+    clearTimeout(bfoTimer);
+    bfoTimer = setTimeout(() => {
+      fetch("/api/bfo", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hz }) });
+    }, 150);
+  });
+  $("bfo-zero").onclick = () => {
+    $("bfo").value = 0;
+    $("bfo-val").textContent = "0 Hz";
+    fetch("/api/bfo", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hz: 0 }) });
   };
   let sqTimer = null;
   $("squelch").addEventListener("input", (e) => {
@@ -193,6 +229,7 @@ function switchBand(band) {
   document.querySelectorAll(".tab").forEach((b) =>
     b.classList.toggle("active", b.dataset.band === band));
   S.band = band;
+  S.mode = null;  // let the new band pick its default demodulator
   $("radio-controls").style.visibility = band === "tv" ? "hidden" : "visible";
   $("view-spectrum").hidden = band === "tv";
   $("view-tv").hidden = band !== "tv";
@@ -200,6 +237,28 @@ function switchBand(band) {
   updatePanelVisibility();
   if (band === "tv") { renderTv(); return; }
   tuneTo(band, band !== prevBand ? BAND_DEFAULT[band] : S.freq);
+}
+
+function renderModeRow(st) {
+  const row = $("mode-row");
+  const modes = (st.bands && st.bands[S.band] && st.bands[S.band].modes) || [];
+  const labels = { wfm: "WFM", nbfm: "NBFM", am: "AM", usb: "USB", lsb: "LSB" };
+  row.hidden = modes.length <= 1;
+  row.innerHTML = "";
+  for (const m of modes) {
+    const b = document.createElement("button");
+    b.className = "chip chip-mode" + (m === S.mode ? " active" : "");
+    b.textContent = labels[m] || m.toUpperCase();
+    b.dataset.mode = m;
+    b.onclick = () => {
+      if (S.mode === m) return;
+      S.mode = m;
+      row.querySelectorAll(".chip-mode").forEach((c) =>
+        c.classList.toggle("active", c.dataset.mode === m));
+      tuneTo(S.band, S.freq, true);
+    };
+    row.appendChild(b);
+  }
 }
 
 function renderPresets() {
@@ -234,11 +293,14 @@ function submitFreq() {
 async function tuneTo(band, freq, force) {
   S.band = band;
   updateReadout(freq);
+  const body = { band, freq_hz: Math.round(freq) };
+  if (S.mode) body.mode = S.mode;
   const res = await fetch("/api/tune", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ band, freq_hz: Math.round(freq) }),
+    body: JSON.stringify(body),
   }).then((r) => r.json()).catch(() => null);
   if (res && res.ok) {
+    if (res.mode) S.mode = res.mode;
     S.freq = res.freq_hz;
     updateReadout(res.freq_hz);
     flushAudio();
@@ -359,6 +421,7 @@ function connectSpectrum(proto) {
       updateMeter(ev);
       updateRds(ev);
       updateScan(ev);
+      updateSql(ev);
       if (ev.band === S.band && Math.abs(ev.freq_hz - S.freq) > 500) {
         updateReadout(ev.freq_hz);   // server-driven change (e.g. scanner)
       }
@@ -411,6 +474,17 @@ function updateRds(ev) {
       : "";
 }
 
+// ------------------------------------------------------------ squelch badge
+function updateSql(ev) {
+  const line = $("sql-line");
+  if (ev.squelch_db == null) { line.hidden = true; return; }
+  line.hidden = false;
+  const open = !!ev.squelch_open;
+  $("sql-dot").className = "dot " + (open ? "sql-open" : "sql-closed");
+  $("sql-text").textContent = "SQUELCH " + (open ? "OPEN" : "CLOSED") +
+    " \u00b7 " + ev.squelch_db.toFixed(0) + " dB";
+}
+
 // ------------------------------------------------------------ scanner panel
 function updateScan(ev) {
   const sc = ev.scan;
@@ -444,6 +518,26 @@ function updateScan(ev) {
       : "linear-gradient(90deg, #0e7490, #22d3ee)";
     $("chan-val").textContent = ev.chan_db.toFixed(0) + " dB" +
       (ev.squelch_open ? " open" : "");
+  }
+
+  const mem = $("scan-mem");
+  const entries = sc.memory || [];
+  if (entries.length) {
+    mem.innerHTML = entries.slice(0, 6).map((e) => {
+      const t = e.last
+        ? new Date(e.last * 1000).toLocaleTimeString([],
+            { hour: "2-digit", minute: "2-digit" })
+        : "--:--";
+      return '<div class="mem-row" data-hz="' + e.hz + '">' +
+        '<span class="mem-freq">' + (e.hz / 1e6).toFixed(3) + "</span>" +
+        '<span class="mem-hits">\u00d7' + e.hits + "</span>" +
+        '<span class="mem-last">' + t + "</span></div>";
+    }).join("");
+    mem.querySelectorAll(".mem-row").forEach((r) => {
+      r.onclick = () => tuneTo(S.band, parseInt(r.dataset.hz, 10));
+    });
+  } else {
+    mem.innerHTML = "<div class='empty'>no stations memorized yet</div>";
   }
 
   const log = $("scan-log");

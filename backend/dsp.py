@@ -306,6 +306,79 @@ class AmDemod:
         self.dc_zi[:] = 0
 
 
+class SsbDemod:
+    """Single-sideband demodulator (USB / LSB) — phasing method.
+
+    Signal path: offset-tuned capture -> channel filter -> BFO fine shift
+    -> one-sided complex bandpass selecting the wanted sideband -> real
+    part = audio. Usable on the airband (military / utility SSB users) and
+    on the AM band (shortwave SSB via v3 direct sampling).
+
+    The BFO is a clarifier: with the dial on the suppressed carrier, a
+    positive BFO value shifts the passband DOWN (for a station tuned a
+    little too high), negative shifts it up. Range +/-3 kHz.
+    """
+
+    IF_RATE = 240_000
+    VOICE_LO_HZ = 275.0     # lower edge of the selected sideband
+    VOICE_HI_HZ = 3_175.0   # upper edge (275..3175 from LPF @1450 + shift 1725)
+
+    def __init__(self, fs, lo_offset_hz, side="usb", bfo_hz=0.0,
+                 channel_bw_hz=6_800):
+        self.fs = float(fs)
+        self.lo_offset = float(lo_offset_hz)
+        self.side = "lsb" if str(side).lower() == "lsb" else "usb"
+        self.nco = NcoMixer(self.lo_offset, self.fs)
+        self.dec1 = Decimator(10, 120_000, self.fs, numtaps=129)   # -> 240 kSPS
+        # wide enough that a full +/-3 kHz BFO shift keeps the voice band
+        # inside the channel filter, still rejecting 25 kHz neighbours
+        self.dec2 = Decimator(5, channel_bw_hz, self.IF_RATE, numtaps=321)
+        self._bfo_ph = 0.0
+        self.set_bfo(bfo_hz)
+        # one-sided voice bandpass: real LPF (pass +/-1450 Hz @ 48 kSPS)
+        # modulated up (USB) or down (LSB) by 1725 Hz -> complex taps
+        base = lowpass_taps(255, 1_450.0, AUDIO_RATE).astype(np.float64)
+        nn = np.arange(len(base), dtype=np.float64)
+        sgn = 1.0 if self.side == "usb" else -1.0
+        self.sb_b = (base * np.exp(
+            sgn * 1j * 2.0 * np.pi * 1_725.0 * nn / AUDIO_RATE))
+        self.sb_zi = np.zeros(len(self.sb_b) - 1, dtype=np.complex128)
+        self._agc = 0.5
+        self.last_chan_db = None
+
+    def set_bfo(self, hz):
+        """Clarifier offset in Hz; phase-continuous (no audio click)."""
+        self.bfo_hz = float(np.clip(float(hz), -3_000.0, 3_000.0))
+        self._bfo_inc = 2.0 * np.pi * self.bfo_hz / AUDIO_RATE
+
+    def process(self, raw):
+        x = self.nco.process(raw)
+        x = self.dec1.process(x)
+        x = self.dec2.process(x)
+        self.last_chan_db = 10.0 * float(np.log10(
+            np.mean(np.abs(x) ** 2) + 1e-12))
+        # BFO fine shift, phase-continuous across blocks
+        n = len(x)
+        ph = self._bfo_ph + self._bfo_inc * np.arange(n, dtype=np.float64)
+        self._bfo_ph = float((self._bfo_ph + self._bfo_inc * n) % (2.0 * np.pi))
+        xb = x * np.exp(-1j * ph).astype(np.complex64)
+        y, self.sb_zi = signal.lfilter(self.sb_b, 1.0,
+                                       xb.astype(np.complex128), zi=self.sb_zi)
+        audio = y.real * 2.0
+        # slow AGC like the AM path (SSB level wanders with the operator)
+        peak = float(np.max(np.abs(audio)) + 1e-9)
+        self._agc = 0.999 * self._agc + 0.001 * peak
+        return to_int16(audio * (0.8 / self._agc))
+
+    def reset(self):
+        self.nco.set_freq(self.lo_offset)
+        self.dec1.reset()
+        self.dec2.reset()
+        self.sb_zi[:] = 0
+        self._bfo_ph = 0.0
+        self._agc = 0.5
+
+
 def to_int16(audio, scale=0.9):
     """Float audio in ~[-1, 1] -> soft-limited int16 mono block."""
     x = np.asarray(audio, dtype=np.float64)

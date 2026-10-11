@@ -51,12 +51,25 @@ async def api_status():
 @app.post("/api/tune")
 async def api_tune(body: dict):
     try:
-        applied = engine.tune(band=body.get("band"), freq_hz=body.get("freq_hz"))
+        applied = engine.tune(band=body.get("band"),
+                              freq_hz=body.get("freq_hz"),
+                              mode=body.get("mode"))
     except (ValueError, TypeError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     if "gain_db" in body and body["gain_db"] is not None:
         engine.set_gain(float(body["gain_db"]))
     return {"ok": True, **applied, "gen": engine.current_gen()}
+
+
+@app.post("/api/bfo")
+async def api_bfo(body: dict):
+    """SSB clarifier: fine tuning offset in Hz (+/-3000)."""
+    try:
+        hz = engine.set_bfo(float(body.get("hz", 0)))
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "invalid bfo"},
+                            status_code=400)
+    return {"ok": True, "bfo_hz": hz}
 
 
 @app.post("/api/gain")
@@ -79,12 +92,21 @@ async def api_scan(body: dict):
     if action == "stop":
         engine.stop_scan()
         return {"ok": True, "scan": engine.scan_status()}
+    if action == "clear_memory":
+        engine.clear_memory()
+        return {"ok": True, "memory": engine.memory_list()}
     list_name = body.get("list") or "noaa"
     try:
-        engine.start_scan(list_name, squelch_db=body.get("squelch_db"))
+        engine.start_scan(list_name, squelch_db=body.get("squelch_db"),
+                          order=body.get("order"))
     except (ValueError, TypeError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     return {"ok": True, "scan": engine.scan_status()}
+
+
+@app.get("/api/scan/memory")
+async def api_scan_memory():
+    return {"memory": engine.memory_list(24)}
 
 
 @app.get("/api/tv/status")
@@ -161,6 +183,8 @@ async def ws_spectrum(ws: WebSocket):
                     "gen": engine.current_gen(),
                     "band": engine.band,
                     "freq_hz": engine.freq,
+                    "demod_mode": engine.demod_mode(),
+                    "bfo_hz": engine.bfo_hz,
                     "rds": engine.current_rds(),
                     "scan": engine.scan_status(),
                     "squelch_db": engine.squelch_db,

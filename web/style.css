@@ -290,3 +290,39 @@ input[type="range"]::-moz-range-thumb {
 .stat-right { margin-left: auto; }
 #stat-ws.bad { color: var(--red); }
 #stat-ws.good { color: var(--green); }
+
+/* ---------- v1.2: mode row, BFO clarifier, squelch badge, scan memory ---------- */
+.mode-row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.chip-mode { min-width: 46px; text-align: center; }
+
+.btn-mini {
+  padding: 1px 8px; font-size: 11px; line-height: 1.5;
+  border-radius: 6px; flex: 0 0 auto;
+}
+.bfo-row { margin-top: 8px; }
+.bfo-row input[type="range"] { flex: 1 1 auto; min-width: 0; }
+
+.sql-line {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 10px;
+  font-family: var(--mono); font-size: 11px; letter-spacing: 1px;
+  color: var(--text-dim);
+}
+.sql-line .dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
+.dot.sql-open { background: var(--green); box-shadow: 0 0 6px rgba(52, 211, 153, .8); }
+.dot.sql-closed { background: var(--text-faint); }
+
+.mem-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-top: 12px; margin-bottom: 4px;
+}
+.scan-mem { font-family: var(--mono); font-size: 11.5px; }
+.scan-mem .empty { color: var(--text-faint); padding: 2px 0; }
+.mem-row {
+  display: flex; gap: 10px; padding: 2px 4px; cursor: pointer;
+  border-radius: 5px; color: var(--amber);
+}
+.mem-row:hover { background: rgba(251, 191, 36, .08); }
+.mem-freq { flex: 1 1 auto; }
+.mem-hits { color: var(--text-dim); }
+.mem-last { color: var(--text-faint); }

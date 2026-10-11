@@ -9,6 +9,8 @@ venv/
 *.log
 *.wav
 *.raw
+scan_memory.json
+scan_memory_test.json
 
 # OS / editor
 .DS_Store

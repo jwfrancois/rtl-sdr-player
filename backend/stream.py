@@ -11,6 +11,8 @@ v1.1 additions:
   * a scanner that hops a channel list, holds on squelch-opening activity
     and logs what it found
 """
+import json
+import os
 import threading
 import time
 from collections import deque
@@ -21,6 +23,10 @@ from . import config as cfg
 from . import device as devmod
 from . import dsp
 
+# Demodulation modes available per band (UI mode buttons come from
+# cfg.BANDS[band]["modes"]; the SSB modes use the phasing demodulator).
+DEFAULT_MODE = {"wfm": "wfm", "wx": "nbfm", "am": "am", "air": "am"}
+
 
 class ReceiverEngine:
     def __init__(self, conf, prefer_sim=False):
@@ -30,6 +36,8 @@ class ReceiverEngine:
         self.info = {}
         self.band = conf["default_band"]
         self.freq = cfg.clamp_to_band(conf["default_freq_hz"], self.band)
+        self.mode = None                # None -> band default
+        self.bfo_hz = 0.0               # SSB clarifier offset
         self.gain_db = None  # None -> AGC
         self.gen = 0
         self._pending = None
@@ -46,13 +54,21 @@ class ReceiverEngine:
         self.squelch_db = None          # None -> squelch off
         self.squelch_open = True
         self._sq_last_open = 0.0
+        self._sq_user = False           # user has taken squelch control
         self.chan_db = None             # live channel-power reading
+
+        # station/scan memory: {"freqs": {hz_str: {hz, hits, last}}}
+        self._mem_path = os.path.join(cfg.ROOT,
+                                      conf.get("scan_memory_file",
+                                               "scan_memory.json"))
+        self.memory = self._load_memory()
 
         # scanner state
         self._scan = {
             "running": False, "list": None, "idx": 0, "state": "scan",
             "freq_hz": None, "last_active_hz": None, "log": deque(maxlen=8),
             "hop_t": 0.0, "hop_gen": 0, "closed_t": None,
+            "freqs": [], "order": "linear",
         }
 
     # ------------------------------------------------------------------
@@ -80,20 +96,34 @@ class ReceiverEngine:
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
-    def tune(self, band=None, freq_hz=None):
+    def tune(self, band=None, freq_hz=None, mode=None):
         with self._lock:
             if self._scan["running"]:
                 self._scan["running"] = False  # manual tune wins over scanner
             band = band or self.band
             if band not in cfg.BANDS:
                 raise ValueError(f"unknown band: {band}")
+            if mode is not None:
+                if mode not in cfg.BANDS[band]["modes"]:
+                    raise ValueError(
+                        f"mode {mode} not available on band {band}")
+                self.mode = mode
+            elif self.mode not in (None, *cfg.BANDS[band]["modes"]):
+                self.mode = None  # previous mode invalid here -> default
             if freq_hz is None:
                 freq_hz = cfg.band_default_freq(
                     band, self.conf["default_band"],
                     self.conf["default_freq_hz"])
             freq_hz = cfg.clamp_to_band(int(freq_hz), band)
+            # comm bands (NBFM weather / airband AM) default to squelch ON
+            # so the channel stays quiet between transmissions
+            if band != self.band and not self._sq_user:
+                auto = self.conf.get("squelch_auto_bands") or {}
+                self.squelch_db = (float(self.conf["squelch_default_db"])
+                                   if auto.get(band) else None)
             self._pending = ("tune", band, freq_hz)
-        return {"band": band, "freq_hz": freq_hz}
+        return {"band": band, "freq_hz": freq_hz,
+                "mode": self.demod_mode()}
 
     def set_gain(self, gain_db):
         with self._lock:
@@ -103,24 +133,45 @@ class ReceiverEngine:
         """db: threshold in dB of channel power, or None to disable."""
         with self._lock:
             self.squelch_db = None if db in (None, "off") else float(db)
+            self._sq_user = True   # user decision beats band defaults
 
-    def start_scan(self, list_name, squelch_db=None):
+    def set_bfo(self, hz):
+        """SSB clarifier offset (Hz); applied to the live demodulator."""
+        hz = max(-3000.0, min(3000.0, float(hz)))
+        with self._lock:
+            self.bfo_hz = hz
+            self._pending = ("bfo", hz)
+        return hz
+
+    def start_scan(self, list_name, squelch_db=None, order=None):
         with self._lock:
             if list_name not in cfg.SCAN_LISTS:
                 raise ValueError(f"unknown scan list: {list_name}")
             if squelch_db is not None:
                 self.squelch_db = float(squelch_db)
+                self._sq_user = True
             elif self.squelch_db is None:
                 self.squelch_db = float(self.conf["squelch_default_db"])
+                self._sq_user = True
             entry = cfg.SCAN_LISTS[list_name]
+            freqs = list(entry["freqs"])
+            # smart order: visit the channels with remembered activity first
+            order = order if order in ("linear", "smart") else "linear"
+            if order == "smart":
+                mem = self.memory.get("freqs", {})
+                rank = {int(k): (v.get("hits", 0), v.get("last", 0.0))
+                        for k, v in mem.items()}
+                freqs.sort(key=lambda f: (-rank.get(f, (0, 0.0))[0],
+                                          -rank.get(f, (0, 0.0))[1]))
             self._scan.update({
                 "running": True, "list": list_name, "idx": 0,
-                "state": "scan", "freq_hz": entry["freqs"][0],
+                "state": "scan", "freq_hz": freqs[0],
                 "last_active_hz": None, "closed_t": None,
                 "hop_t": time.monotonic(), "hop_gen": self.gen + 1,
+                "freqs": freqs, "order": order,
             })
-            self._pending = ("tune", entry["band"], entry["freqs"][0])
-        return {"ok": True, "list": list_name}
+            self._pending = ("tune", entry["band"], freqs[0])
+        return {"ok": True, "list": list_name, "order": order}
 
     def stop_scan(self):
         with self._lock:
@@ -138,12 +189,56 @@ class ReceiverEngine:
                 "list": sc["list"],
                 "label": entry.get("label", sc["list"]),
                 "idx": sc["idx"],
-                "count": len(entry.get("freqs", [])),
+                "count": len(sc["freqs"]),
                 "state": sc["state"],
+                "order": sc["order"],
                 "freq_hz": sc["freq_hz"],
                 "last_active_hz": sc["last_active_hz"],
                 "log": list(sc["log"]),
+                "memory": self.memory_list(),
             }
+
+    # ------------------------------------------------------------------
+    # scan memory (persisted station activity)
+    # ------------------------------------------------------------------
+    def _load_memory(self):
+        try:
+            with open(self._mem_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and isinstance(data.get("freqs"), dict):
+                return data
+        except (OSError, ValueError):
+            pass
+        return {"freqs": {}}
+
+    def _save_memory(self):
+        try:
+            tmp = self._mem_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.memory, fh)
+            os.replace(tmp, self._mem_path)
+        except OSError:
+            pass  # memory is a convenience; never break the capture loop
+
+    def _record_hit(self, hz):
+        entry = self.memory["freqs"].setdefault(
+            str(int(hz)), {"hz": int(hz), "hits": 0, "last": 0.0})
+        entry["hits"] += 1
+        entry["last"] = round(time.time(), 1)
+        self._save_memory()
+
+    def memory_list(self, limit=12):
+        """Most-active channels first (hits desc, then most recently heard)."""
+        entries = sorted(self.memory.get("freqs", {}).values(),
+                         key=lambda e: (-e.get("hits", 0),
+                                        -e.get("last", 0.0)))
+        return entries[:limit]
+
+    def clear_memory(self):
+        with self._lock:
+            self.memory = {"freqs": {}}
+            self._save_memory()
+        return {"ok": True}
 
     def subscribe(self):
         """Register an audio consumer. Each gets its own bounded queue so
@@ -190,8 +285,8 @@ class ReceiverEngine:
             return None
 
     def demod_mode(self):
-        return {"wfm": "wfm", "wx": "nbfm", "air": "am", "am": "am"}.get(
-            self.band, self.band)
+        mode = self.mode or DEFAULT_MODE.get(self.band, self.band)
+        return mode
 
     def status(self):
         from . import tv
@@ -202,6 +297,8 @@ class ReceiverEngine:
                 "region": self.conf.get("region", "US"),
                 "de_emphasis_us": self.conf.get("de_emphasis_us", 75),
                 "mode": self.info.get("mode"),
+                "demod_mode": self.demod_mode(),
+                "bfo_hz": self.bfo_hz,
                 "device": self.info.get("device"),
                 "backend": self.info.get("backend"),
                 "note": self.info.get("note"),
@@ -213,6 +310,7 @@ class ReceiverEngine:
                 "bands": cfg.BANDS,
                 "scan_lists": {k: v["label"] for k, v in cfg.SCAN_LISTS.items()},
                 "squelch_db": self.squelch_db,
+                "squelch_default_db": self.conf.get("squelch_default_db"),
                 "squelch_open": self.squelch_open,
                 "chan_db": self.chan_db,
                 "scan": self.scan_status(),
@@ -226,10 +324,19 @@ class ReceiverEngine:
     # internals
     # ------------------------------------------------------------------
     def _make_demod(self):
+        mode = self.demod_mode()
         if self.band == "am":
+            if mode in ("usb", "lsb"):
+                return dsp.SsbDemod(self.conf["am_sample_rate"],
+                                    lo_offset_hz=0.0, side=mode,
+                                    bfo_hz=self.bfo_hz)
             return dsp.AmDemod(self.conf["am_sample_rate"],
                                lo_offset_hz=0.0, channel_bw_hz=7_500)
         if self.band == "air":
+            if mode in ("usb", "lsb"):
+                return dsp.SsbDemod(self.conf["fm_sample_rate"],
+                                    self.conf["lo_offset_hz"], side=mode,
+                                    bfo_hz=self.bfo_hz)
             return dsp.AmDemod(self.conf["fm_sample_rate"],
                                lo_offset_hz=self.conf["lo_offset_hz"],
                                channel_bw_hz=5_000)
@@ -273,8 +380,8 @@ class ReceiverEngine:
         """Advance the scanner to the next channel (lock held by caller)."""
         sc = self._scan
         entry = cfg.SCAN_LISTS[sc["list"]]
-        sc["idx"] = (sc["idx"] + 1) % len(entry["freqs"])
-        freq = entry["freqs"][sc["idx"]]
+        sc["idx"] = (sc["idx"] + 1) % len(sc["freqs"])
+        freq = sc["freqs"][sc["idx"]]
         sc["freq_hz"] = freq
         sc["state"] = "scan"
         sc["closed_t"] = None
@@ -298,6 +405,7 @@ class ReceiverEngine:
                 sc["last_active_hz"] = sc["freq_hz"]
                 sc["closed_t"] = None
                 sc["log"].appendleft({"t": time.time(), "hz": sc["freq_hz"]})
+                self._record_hit(sc["freq_hz"])
                 return False
             if now - sc["hop_t"] >= dwell:
                 self._hop_scan()
@@ -329,6 +437,9 @@ class ReceiverEngine:
                     elif kind == "gain":
                         self.gain_db = pending[1]
                         self.device.set_gain(self.gain_db)
+                    elif kind == "bfo":
+                        if hasattr(self._demod, "set_bfo"):
+                            self._demod.set_bfo(pending[1])
                 except Exception as exc:  # keep the loop alive on errors
                     self.info["error"] = f"reconfig failed: {exc}"
                     time.sleep(0.2)
@@ -350,13 +461,15 @@ class ReceiverEngine:
                 rms = float(np.sqrt(np.mean(pcm.astype(np.float64) ** 2)) / 32768.0)
                 rms_db = 20.0 * np.log10(rms + 1e-9)
 
-                # ---- squelch (channel power vs threshold, soft tail) ----
+                # ---- squelch (channel power vs threshold, hysteresis + tail)
                 now = time.monotonic()
                 if self.squelch_db is not None and self.chan_db is not None:
+                    hyst = float(self.conf.get("squelch_hysteresis_db", 4.0))
                     if self.chan_db >= self.squelch_db:
                         self.squelch_open = True
                         self._sq_last_open = now
-                    elif now - self._sq_last_open > 0.5:
+                    elif (self.chan_db < self.squelch_db - hyst
+                          and now - self._sq_last_open > 0.5):
                         self.squelch_open = False
                     sq_open = self.squelch_open
                 else:

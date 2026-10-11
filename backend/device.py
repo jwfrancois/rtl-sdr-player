@@ -95,6 +95,8 @@ class SimDevice:
     #   kind "rds"  - wfm + 19 kHz pilot + RDS subcarrier (decoder test)
     #   kind "am"   - AM voice (airband quadrature or AM-band direct)
     #   kind "nbfm" - narrowband FM voice (NOAA weather)
+    #   kind "ssb"  - USB voice, carrier suppressed (analytic envelope)
+    #   kind "ssbl" - LSB voice, carrier suppressed (conjugate envelope)
     STATIONS = [
         (88.5e6, 0.55, "wfm"), (92.3e6, 0.40, "wfm"),
         (96.1e6, 0.72, "rds"),
@@ -102,6 +104,7 @@ class SimDevice:
         (640e3, 0.50, "am"), (820e3, 0.66, "am"),
         (1010e3, 0.42, "am"), (1330e3, 0.56, "am"),
         (121.5e6, 0.50, "am"), (122.8e6, 0.42, "am"), (123.1e6, 0.38, "am"),
+        (119.2e6, 0.50, "ssb"), (123.45e6, 0.45, "ssbl"),
         (162.400e6, 0.45, "nbfm"), (162.550e6, 0.55, "nbfm"),
     ]
 
@@ -164,7 +167,7 @@ class SimDevice:
         for freq, amp, kind in self.STATIONS:
             off = freq - self.center
             if is_am_band:
-                if kind != "am":
+                if kind not in ("am", "ssb", "ssbl"):
                     continue
                 # direct sampling: the tuned station lands at DC naturally
             elif abs(off) > fs * 0.47:
@@ -182,6 +185,18 @@ class SimDevice:
                 # AM voice: carrier + modulated sidebands
                 sig = (1.0 + 0.5 * audio * lfo) * np.exp(
                     1j * (two_pi * off * t)).astype(np.complex64)
+            elif kind in ("ssb", "ssbl"):
+                # Single sideband, carrier suppressed. The complex envelope
+                # of a USB voice is the ANALYTIC signal (positive-frequency
+                # tones only); LSB is its conjugate. Voice tones stay inside
+                # the 300-3000 Hz SSB passband on purpose.
+                va = (np.exp(1j * two_pi * 440.0 * t)
+                      + 0.5 * np.exp(1j * (two_pi * 880.0 * t + 1.1))
+                      + 0.25 * np.exp(1j * (two_pi * 1320.0 * t + 2.3))
+                      ) / 1.75 * lfo
+                if kind == "ssbl":
+                    va = np.conj(va)
+                sig = (va * np.exp(1j * two_pi * off * t)).astype(np.complex64)
             elif kind == "nbfm":
                 # +/-5 kHz deviation, integrated properly for the NBFM scale
                 acc = self._acc_for(freq)

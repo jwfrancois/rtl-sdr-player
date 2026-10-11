@@ -58,6 +58,19 @@
 
       <div class="presets" id="presets"></div>
 
+      <div class="mode-row" id="mode-row" hidden></div>
+
+      <div class="scan-row sq-row bfo-row" id="bfo-row" hidden>
+        <span class="lbl">BFO</span>
+        <input type="range" id="bfo" min="-3000" max="3000" value="0" step="10">
+        <span class="scan-db" id="bfo-val">0 Hz</span>
+        <button id="bfo-zero" class="btn btn-mini" title="Zero the BFO">0</button>
+      </div>
+
+      <div class="sql-line" id="sql-line" hidden>
+        <span class="dot" id="sql-dot"></span><span id="sql-text">SQUELCH</span>
+      </div>
+
       <div class="meter-row">
         <span class="lbl">SIGNAL</span>
         <div class="meter"><div class="meter-fill" id="meter-fill"></div></div>
@@ -95,6 +108,10 @@
         </div>
         <div class="scan-row">
           <select id="scan-list"></select>
+          <select id="scan-order" title="Channel order">
+            <option value="linear">Linear order</option>
+            <option value="smart">Smart: most active first</option>
+          </select>
           <button id="scan-btn" class="btn btn-accent scan-btn">Scan</button>
         </div>
         <div class="scan-row sq-row">
@@ -107,6 +124,11 @@
           <div class="meter"><div class="meter-fill chan" id="chan-fill"></div></div>
           <span class="scan-db" id="chan-val">&mdash;</span>
         </div>
+        <div class="mem-head">
+          <span class="lbl">MEMORY</span>
+          <button id="mem-clear" class="btn btn-mini" title="Clear learned activity">Clear</button>
+        </div>
+        <div class="scan-mem" id="scan-mem"></div>
         <div class="scan-log" id="scan-log"></div>
       </div>
     </div>

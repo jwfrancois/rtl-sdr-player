@@ -68,12 +68,16 @@ async def main():
 
     # ---- 1. status ----
     st = rest("/api/status")
-    check("status version 1.1.0", st["version"] == "1.1.0", st["version"])
+    st_bands_wx_presets = st["bands"]["wx"]["presets"]
+    check("status version 1.2.0", st["version"] == "1.2.0", st["version"])
     check("region US", st.get("region") == "US")
     check("de-emphasis 75 us", st.get("de_emphasis_us") == 75)
     check("bands wx+air present", "wx" in st["bands"] and "air" in st["bands"])
     check("scan lists", set(st["scan_lists"]) == {"noaa", "air_key", "air_band"})
     check("wx presets", len(st["bands"]["wx"]["presets"]) == 7)
+    check("air modes am/usb/lsb",
+          st["bands"]["air"]["modes"] == ["am", "usb", "lsb"])
+    rest("/api/scan", {"action": "clear_memory"})  # isolate from prior runs
 
     # ---- 2. RDS on 96.1 ----
     rest("/api/tune", {"band": "wfm", "freq_hz": 96_100_000})
@@ -97,6 +101,21 @@ async def main():
     await collect_audio(2.0, chunks)
     rms = rms_of(chunks)
     check("audio rms audible", rms > -40, f"{rms:.1f} dBFS, {len(chunks)} chunks")
+
+    # ---- 3b. auto-squelch on comm bands (before any manual squelch call) ----
+    expected_auto = rest("/api/status")["squelch_default_db"]
+    rest("/api/tune", {"band": "wx", "freq_hz": 162_550_000})
+    await asyncio.sleep(1.0)
+    st = rest("/api/status")
+    check("auto squelch enabled on WX", st["squelch_db"] == expected_auto,
+          f"{st['squelch_db']} vs default {expected_auto}")
+    check("auto squelch open on signal", st["squelch_open"] is True,
+          f"chan {st['chan_db']}")
+    rest("/api/tune", {"band": "wfm", "freq_hz": 99_900_000})
+    await asyncio.sleep(0.8)
+    st = rest("/api/status")
+    check("squelch auto-off back on FM", st["squelch_db"] is None,
+          str(st["squelch_db"]))
 
     # ---- 4. squelch ----
     rest("/api/tune", {"band": "wx", "freq_hz": 162_550_000})
@@ -172,6 +191,73 @@ async def main():
           bool(found) and found["last_active_hz"] in
           (121_500_000, 122_800_000, 123_100_000),
           str(found and found["last_active_hz"]))
+
+    # ---- 7. scan memory + smart order ----
+    mem = rest("/api/scan/memory")["memory"]
+    check("scan memory has entries", len(mem) >= 1,
+          str([(e["hz"], e["hits"]) for e in mem][:4]))
+    check("memory sorted by hits",
+          all(mem[i]["hits"] >= mem[i + 1]["hits"]
+              for i in range(len(mem) - 1)),
+          str([(e["hz"], e["hits"]) for e in mem][:4]))
+    # smart order ranks only the scan list's channels: expected top NOAA channel
+    wx_hz = [p["hz"] for p in st_bands_wx_presets]
+    hits_for = {h: next((e["hits"] for e in mem if e["hz"] == h), 0)
+                for h in wx_hz}
+    last_for = {h: next((e["last"] for e in mem if e["hz"] == h), 0.0)
+                for h in wx_hz}
+    expected_top = max(wx_hz, key=lambda h: (hits_for[h], last_for[h]))
+    rest("/api/scan", {"action": "start", "list": "noaa", "order": "smart"})
+    await asyncio.sleep(0.5)
+    sc = rest("/api/status")["scan"]
+    check("smart order accepted", sc.get("order") == "smart", str(sc.get("order")))
+    check("smart scan starts on most-active NOAA channel",
+          sc["freq_hz"] == expected_top,
+          f"{sc['freq_hz']} vs expected {expected_top}")
+    rest("/api/scan", {"action": "stop"})
+    rest("/api/scan", {"action": "clear_memory"})
+    mem = rest("/api/scan/memory")["memory"]
+    check("memory clears", len(mem) == 0, str(mem))
+
+    # ---- 8. SSB (USB/LSB) on the airband ----
+    r = rest("/api/tune", {"band": "air", "freq_hz": 119_200_000,
+                           "mode": "usb"})
+    await asyncio.sleep(1.2)
+    st = rest("/api/status")
+    check("ssb mode applied", st["demod_mode"] == "usb", str(st["demod_mode"]))
+    chunks = []
+    await collect_audio(1.5, chunks)
+    rms = rms_of(chunks)
+    check("ssb usb audio audible", rms > -40, f"{rms:.1f} dBFS")
+    # wrong sideband must stay quiet (sideband selection works)
+    rest("/api/tune", {"band": "air", "freq_hz": 119_200_000, "mode": "lsb"})
+    await asyncio.sleep(1.2)
+    chunks = []
+    await collect_audio(1.5, chunks)
+    rms_wrong = rms_of(chunks)
+    check("wrong sideband rejected", rms_wrong < rms - 15,
+          f"lsb {rms_wrong:.1f} vs usb {rms:.1f} dBFS")
+    # clarifier endpoint
+    rest("/api/bfo", {"hz": 500})
+    st = rest("/api/status")
+    check("bfo set + reported", st["bfo_hz"] == 500, str(st["bfo_hz"]))
+    rest("/api/bfo", {"hz": 0})
+    # LSB station
+    rest("/api/tune", {"band": "air", "freq_hz": 123_450_000, "mode": "lsb"})
+    await asyncio.sleep(1.2)
+    chunks = []
+    await collect_audio(1.5, chunks)
+    rms = rms_of(chunks)
+    check("ssb lsb audio audible", rms > -40, f"{rms:.1f} dBFS")
+    # mode validation (server answers 400)
+    import urllib.error
+    try:
+        bad = rest("/api/tune", {"band": "wfm", "freq_hz": 99_900_000,
+                                 "mode": "usb"})
+        check("invalid mode rejected", bad.get("ok") is False, str(bad))
+    except urllib.error.HTTPError as exc:
+        check("invalid mode rejected", exc.code == 400, f"HTTP {exc.code}")
+    rest("/api/tune", {"band": "wfm", "freq_hz": 99_900_000})
 
     print()
     if fails:

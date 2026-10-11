@@ -8,11 +8,12 @@ analyzer and waterfall, right in your browser. Built and pinned for the **USA**.
 Dongle → [this app] → http://localhost:8515
              │
              ├── FM band 87.5–108 MHz    wideband FM + RDS/RBDS (US tables)
-             ├── AM band 530–1700 kHz    direct-sampling (Q) mode (v3 feature)
+             ├── AM band 530–1700 kHz    direct-sampling (Q) mode (v3 feature),
+             │                           plus USB/LSB for shortwave SSB
              ├── WX tab                  NOAA Weather Radio 162.400–162.550
              │                           (narrowband FM, 7 channel presets)
-             ├── AIR tab                 US airband 118–137 MHz (AM) with a
-             │                           squelch scanner + key-channel presets
+             ├── AIR tab                 US airband 118–137 MHz: AM + USB/LSB,
+             │                           squelch scanner + station memory
              ├── Live spectrum + waterfall with click-to-tune
              └── TV tab                  DVB-T capability detection + guide
                                          (Linux: full channel scan & playback)
@@ -76,7 +77,26 @@ macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 
 ---
 
-## What's new in v1.1 (USA edition)
+## What's new in v1.2
+
+- **SSB (USB/LSB) demodulation** — the AIR and AM bands gain single-sideband
+  via a phasing demodulator (one-sided 300–3175 Hz voice bandpass on the
+  complex baseband). Listen to military/utility SSB users around the airband
+  and shortwave-style SSB on the AM band. A **BFO clarifier** slider
+  (±3 kHz, phase-continuous) fine-tunes the pitch, with a zero button.
+- **NBFM/AM squelch everywhere** — squelch now engages **automatically** when
+  you switch to the WX or AIR band (that's what those bands are for) and
+  releases again on FM/AM broadcast, until you touch the SQL slider yourself.
+  Closing now uses **hysteresis** (4 dB below the open threshold) plus the
+  0.5 s tail, so channels don't stutter on/off at the threshold. A live
+  SQUELCH OPEN/CLOSED badge shows the gate state.
+- **Scan memory with smart sorting** — every scanner hold is memorized
+  (frequency, hit count, last-heard time) in `scan_memory.json` and survives
+  restarts. Pick **Smart: most active first** and the scanner visits the
+  busiest channels first; the MEMORY table (top hits, clickable) and a Clear
+  button live in the scanner panel.
+
+## What was new in v1.1 (USA edition)
 
 - **75 µs de-emphasis pinned** — the FM de-emphasis time constant and the
   RBDS program-type table are set for the US (`"region": "US"` in
@@ -106,7 +126,9 @@ The scanner (and the SQL slider on WX/AIR bands) gates audio on **channel
 power**: the energy inside the 8 kHz-wide channel after filtering, in dB.
 Noise-only channels sit around −50…−35 dB; any real carrier lands well above
 −20 dB. Start at −20 dB and adjust: too high and weak stations never open the
-gate, too low and the scanner parks on noise.
+gate, too low and the scanner parks on noise. The gate opens at the SQL
+value and only closes 4 dB *below* it (hysteresis) after 0.5 s of quiet —
+squelch doesn't chatter on marginal carriers.
 
 ## Using it
 
@@ -117,6 +139,8 @@ gate, too low and the scanner parks on noise.
   type a frequency and press Enter. FM shows MHz, AM shows kHz.
 - **Presets**: WX and AIR tabs show clickable channel chips (WX1–WX7, Guard,
   CTAF…). The active one is highlighted.
+- **Mode chips** (AIR/AM bands): AM / USB / LSB. In USB or LSB the BFO slider
+  appears — drag to de-tune until voices sound natural, press **0** to reset.
 - **RDS panel** (FM tab): appears under the demod info line. PS name lights
   up first (it completes after all four 2-character segments arrive),
   RadioText and AF list follow. STEREO = 19 kHz pilot detected.
@@ -165,8 +189,9 @@ scanning, and RDS-decoding FM.
 With no dongle present the app runs a synthetic RF spectrum so you can try
 everything: six FM stations (the one at **96.1 MHz carries a full RDS +
 stereo-pilot test signal** — PI `2A5B`, PS `SIM-RDS`), four AM stations,
-airband AM on 121.5/122.8/123.1, and NOAA voice on 162.400/162.550. Start it
-explicitly with `python app.py --sim`.
+airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB) and 123.450
+(LSB)**, and NOAA voice on 162.400/162.550. Start it explicitly with
+`python app.py --sim`.
 
 ## Configuration (`config.json`)
 
@@ -180,8 +205,11 @@ explicitly with `python app.py --sim`.
 | `sim_fallback` | true | Run a synthetic demo when no dongle is present |
 | `lo_offset_hz` | 250000 | Offset tuning that dodges the RTL-SDR's center DC spike |
 | `squelch_default_db` | -20 | Channel-power squelch threshold used by the scanner |
+| `squelch_hysteresis_db` | 4.0 | Close threshold sits this far below the open threshold |
+| `squelch_auto_bands` | {"wx": true, "air": true} | Bands that get squelch automatically on switch |
 | `scan_dwell_s` | 0.45 | Seconds spent per channel while hopping |
 | `scan_release_s` | 2.5 | Squelch-closed time before leaving a held channel |
+| `scan_memory_file` | scan_memory.json | Persisted scanner hit memory (smart sorting) |
 
 ## Troubleshooting
 
@@ -203,14 +231,16 @@ explicitly with `python app.py --sim`.
 
 ```
 app.py               entry point (FastAPI + uvicorn)
-backend/config.py    defaults + band/preset/scan tables
-backend/device.py    RTL-SDR driver layer + synthetic simulator (RDS test signal)
-backend/dsp.py       FM/AM/NBFM demodulation, pilot tracker, decimation, PSD
+backend/config.py    defaults + band/preset/mode/scan tables
+backend/device.py    RTL-SDR driver layer + synthetic simulator (RDS + SSB test signals)
+backend/dsp.py       FM/AM/NBFM/SSB demodulation, pilot tracker, decimation, PSD
 backend/rds.py       RDS decoder (Costas+Gardner+CRC) + test-signal encoder
-backend/stream.py    capture thread, tuning, squelch, scanner, websocket streaming
+backend/stream.py    capture thread, tuning, squelch, scanner + memory, websocket streaming
 backend/tv.py        DVB-T detection, channel scan, TS streaming (Linux)
-web/                 browser UI (spectrum, waterfall, RDS + scanner panels)
+web/                 browser UI (spectrum, waterfall, RDS + scanner + memory panels)
 config.json          user settings
 setup.bat / run.bat  Windows helpers
 run.sh               Linux/macOS launcher
+tests/               self-test suite (codec, DSP chain, engine, REST/WS smoke)
+.github/workflows/   CI: runs the test suite on push (ubuntu + windows)
 ```
