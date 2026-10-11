@@ -24,6 +24,9 @@ const S = {
   squelchTouched: false,
   zoom: { lo: 0, hi: 1 },   // visible window as fractions of the PSD axis
   ctcssTouched: false,
+  offline: false,           // /api/status unreachable -> banner + fast polling
+  audioBackoff: 2500,       // WS retry delays grow while the server is down
+  specBackoff: 2500,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -52,9 +55,34 @@ async function boot() {
 async function refreshStatus() {
   try {
     const st = await (await fetch("/api/status")).json();
+    if (S.offline) markOnline();
     applyStatus(st);
     return st;
-  } catch { return null; }
+  } catch {
+    if (!S.offline) markOffline();
+    return null;
+  }
+}
+
+// Server went away (run.bat closed, PC rebooted, crashed). The dead page
+// used to just spam the console — now it explains itself and recovers.
+function markOffline() {
+  S.offline = true;
+  const host = $("offline-host");
+  if (host) host.textContent = location.host || "localhost:8515";
+  $("offline-banner").hidden = false;
+  $("device-name").textContent = "server offline";
+  $("status-dot").className = "dot off";
+  $("stat-ws").textContent = "offline";
+  $("stat-ws").className = "bad";
+}
+
+function markOnline() {
+  S.offline = false;
+  $("offline-banner").hidden = true;
+  S.audioBackoff = 2500;
+  S.specBackoff = 2500;
+  connectSockets();          // reconnect right now instead of after the backoff
 }
 
 function applyStatus(st) {
@@ -161,7 +189,7 @@ function applyStatus(st) {
 
 async function pollStatus() {
   await refreshStatus();
-  setInterval(refreshStatus, 8000);
+  setInterval(refreshStatus, 5000);   // also drives offline recovery
 }
 
 // Toggle the receiver between the real dongle and the simulator without
@@ -488,6 +516,7 @@ function connectAudio(proto) {
   ws.onopen = () => {
     $("stat-ws").textContent = "connected";
     $("stat-ws").className = "good";
+    S.audioBackoff = 2500;
   };
   ws.onmessage = (msg) => {
     if (typeof msg.data === "string") {
@@ -505,7 +534,8 @@ function connectAudio(proto) {
     if (seq !== S.audioSeq) return;  // superseded by a newer connection
     $("stat-ws").textContent = "reconnecting…";
     $("stat-ws").className = "bad";
-    setTimeout(() => connectAudio(proto), 2500);
+    setTimeout(() => connectAudio(proto), S.audioBackoff);
+    S.audioBackoff = Math.min(S.audioBackoff * 1.8, 10000);
   };
   S.wsAudio = ws;
 }
@@ -535,7 +565,8 @@ function connectSpectrum(proto) {
   };
   ws.onclose = () => {
     if (seq !== S.specSeq) return;
-    setTimeout(() => connectSpectrum(proto), 2500);
+    setTimeout(() => connectSpectrum(proto), S.specBackoff);
+    S.specBackoff = Math.min(S.specBackoff * 1.8, 10000);
   };
   S.wsSpectrum = ws;
 }

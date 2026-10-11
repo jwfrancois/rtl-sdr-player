@@ -26,6 +26,7 @@ class PcmPlayer extends AudioWorkletProcessor {
     this.ratio = 1;            // src(48k) -> ctx rate resampling step
     this.carry = 0;
     this.lastStats = 0;
+    this.volume = null;        // set via {type:"vol"}; falls back to the AudioParam
     this.port.onmessage = (e) => this.onMessage(e.data);
   }
 
@@ -43,8 +44,10 @@ class PcmPlayer extends AudioWorkletProcessor {
       if (msg.targetMs) this.targetMs = msg.targetMs;
       if (msg.ratio) this.ratio = msg.ratio;
     } else if (msg.type === "vol") {
-      const p = this.parameters.get("volume");
-      if (p) p.value = msg.v;
+      // NOTE: AudioWorkletProcessor has no this.parameters — the k-rate
+      // "volume" param is only readable inside process(). Store it here
+      // and let process() apply it (pre-1.3.3 this threw a TypeError).
+      this.volume = msg.v;
     } else if (msg.type === "query") {
       this.port.postMessage({ type: "stats", fillMs: (this.fill / sampleRate) * 1000 });
     }
@@ -53,7 +56,8 @@ class PcmPlayer extends AudioWorkletProcessor {
   process(inputs, outputs, parameters) {
     const out = outputs[0][0];
     if (!out) return true;
-    const vol = parameters.volume[0];
+    const vol = (this.volume !== null && this.volume !== undefined)
+      ? this.volume : parameters.volume[0];
     const target = Math.floor((this.targetMs / 1000) * sampleRate);
 
     if (!this.started) {

@@ -93,6 +93,23 @@ macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 
 ---
 
+## What's new in v1.3.3
+
+- **The page now tells you when the server is down** — if `run.bat` was
+  closed (or the PC rebooted), the browser page used to sit silent while
+  the console filled with `ERR_CONNECTION_REFUSED`. It now shows an amber
+  **"Server not reachable — run run.bat"** banner, keeps polling, and
+  reconnects audio + spectrum by itself the moment the server returns.
+- **Volume slider actually works** — the audio worklet read a property
+  that does not exist on `AudioWorkletProcessor` (`this.parameters`), so
+  every page load threw a `TypeError` and slider moves were ignored.
+  Volume is now stored and applied in the processor's render callback.
+- **Calmer reconnects** — websocket retry intervals grow while the server
+  is down (2.5 → 10 s) instead of hammering every 2.5 s forever.
+- **`run.bat` stays open on errors** — a failed start (Python missing,
+  port busy, crash) no longer flashes a window and vanish; the reason
+  stays on screen until you press a key.
+
 ## What's new in v1.3.2
 
 - **No more DLL hunting** — `pyrtlsdrlib` (added to `requirements.txt`)
@@ -298,6 +315,7 @@ airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB) and 123.450
 | Symptom | Fix |
 |---|---|
 | `Could not open the RTL2832U` | Zadig WinUSB driver not bound yet (step 2); or SDR#/SDR++ is open and holds the stick — close it |
+| Page shows "Server not reachable" | The player app is not running (or was closed). Double-click `run.bat` and leave its window open — the page reconnects by itself |
 | `rtlsdr.dll not found` / DLL warning at the bottom | Run `setup.bat` (installs `pyrtlsdrlib` = automatic DLL); or copy the DLLs from the app's `dlls\` subfolder next to `app.py`; `python check_dlls.py` names the exact problem |
 | WinError 193 in the status bar | The DLL file itself is the wrong bitness (the zip name lied). Delete that DLL from the app folder and run `setup.bat` — or replace it with the x64 copy from the app's `dlls\` subfolder |
 | Dongle won't switch on / falls back to simulation | Click **Use dongle** in the header; the status bar then shows the current reason (DLLs, Zadig driver, or stick busy) |
