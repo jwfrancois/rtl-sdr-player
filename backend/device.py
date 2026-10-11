@@ -114,8 +114,34 @@ class RtlSdrDevice:
             return []
 
     def set_direct_sampling(self, mode):
-        """mode: 'disabled' | 'i' | 'q'  ('q' is used for AM / HF on the v3)"""
-        self.sdr.set_direct_sampling(mode)
+        """mode: 'disabled' | 'i' | 'q'  ('q' is used for AM / HF on the v3)
+
+        pyrtlsdr's string handling changed across releases (older builds
+        accept 'i'/'q', newer ones only 'I'/'Q', and at least 0.4+/0.5
+        reject 'disabled' outright - SyntaxError 'invalid value'). The C
+        API takes an int, and ints are accepted by every version, so
+        normalize to 0/1/2 here and fall back to the string spellings
+        only if a build refuses ints (no known build does).
+        """
+        key = mode.lower() if isinstance(mode, str) else mode
+        code = {"disabled": 0, "i": 1, "q": 2, 0: 0, 1: 1, 2: 2}.get(key)
+        if code is None:
+            raise ValueError(
+                "direct sampling mode must be disabled/i/q, got %r" % (mode,))
+        try:
+            self.sdr.set_direct_sampling(code)
+            return
+        except Exception:
+            pass  # exotic fork? try the documented string tokens
+        for alt in ({0: "disabled", 1: "I", 2: "Q"}[code],
+                    {0: "disabled", 1: "i", 2: "q"}[code]):
+            try:
+                self.sdr.set_direct_sampling(alt)
+                return
+            except Exception:
+                continue
+        raise OSError("set_direct_sampling(%r) rejected by pyrtlsdr/librtlsdr"
+                      % (mode,))
 
     def set_bias_tee(self, on):
         try:

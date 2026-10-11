@@ -93,6 +93,18 @@ macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 
 ---
 
+## What's new in v1.3.4
+
+- **First-hardware-launch crash fixed** — with the dongle finally opening
+  (v1.3.2's DLL work), startup died at `set_direct_sampling("disabled")`
+  with `SyntaxError: invalid value "disabled"` on current pyrtlsdr builds.
+  pyrtlsdr changed its accepted spellings across releases (some take
+  `'i'`/`'q'`, some `'I'`/`'Q'`, none take `'disabled'`), so the app now
+  sends the integers the C API actually uses (0 = off, 1 = I, 2 = Q) and
+  falls back to string spellings only if a build refuses ints. Verified
+  against the real installed pyrtlsdr: the exact reported SyntaxError
+  reproduces without the fix and disappears with it.
+
 ## What's new in v1.3.3
 
 - **The page now tells you when the server is down** — if `run.bat` was
@@ -318,6 +330,7 @@ airband AM on 121.5/122.8/123.1, **SSB voice on 119.200 (USB) and 123.450
 | Page shows "Server not reachable" | The player app is not running (or was closed). Double-click `run.bat` and leave its window open — the page reconnects by itself |
 | `rtlsdr.dll not found` / DLL warning at the bottom | Run `setup.bat` (installs `pyrtlsdrlib` = automatic DLL); or copy the DLLs from the app's `dlls\` subfolder next to `app.py`; `python check_dlls.py` names the exact problem |
 | WinError 193 in the status bar | The DLL file itself is the wrong bitness (the zip name lied). Delete that DLL from the app folder and run `setup.bat` — or replace it with the x64 copy from the app's `dlls\` subfolder |
+| `SyntaxError: invalid value "disabled"` at startup (fixed in 1.3.4) | Old app + new pyrtlsdr clash over direct-sampling spellings — update to v1.3.4+ |
 | Dongle won't switch on / falls back to simulation | Click **Use dongle** in the header; the status bar then shows the current reason (DLLs, Zadig driver, or stick busy) |
 | Device shows but tuning fails | Another process owns the stick; on Linux unload `dvb_usb_rtl28xxu` |
 | Strong distortion on FM | Lower the gain (dropdown) — signal overload |
