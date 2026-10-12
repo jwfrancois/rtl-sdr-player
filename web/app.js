@@ -31,6 +31,7 @@ const S = {
   stationsJson: "",         // change detection against /api/status
   sweepResults: [],         // last all-band sweep (strongest first)
   sweepFetchT: 0,           // throttle for results polling while sweeping
+  auditFetchT: 0,           // throttle for RDS-audit report polling (v1.7)
   agentTouched: 0,          // ts: don't fight the user editing agent UI
   // v1.6: sound studio (EQ + compressor chain, auto preset by station type)
   studio: { auto: true, preset: "music", input: null, filters: [],
@@ -113,6 +114,7 @@ async function boot() {
   pollStatus();
   refreshBookmarks();
   refreshSweepResults();     // last sweep survives server restarts
+  fetchAuditReport();        // last RDS audit report (v1.7)
 }
 
 async function refreshStatus() {
@@ -471,7 +473,7 @@ function wireControls() {
     agentConfigSave({ am_sensitivity: e.target.value });
   });
 
-  // ---- v1.6: preset-bank desktop notifications ----
+  // v1.6: preset-bank desktop notifications ----
   $("st-notify").textContent = S.notify.enabled ? "Notify on" : "Notify";
   $("st-notify").onclick = async () => {
     if (S.notify.enabled) {
@@ -490,6 +492,21 @@ function wireControls() {
         "You will get a ping when re-sweeps / auto-fill / PI lookup "
         + "change the 20 presets.");
     }
+  };
+
+  // ---- v1.7: spectrum-wide RDS audit ----
+  $("audit-btn").onclick = () => {
+    if (S.scanRunning && S.scanMode === "audit") {
+      fetch("/api/audit/stop", { method: "POST" });
+      return;
+    }
+    fetch("/api/audit/start", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dwell_s: parseFloat($("audit-dwell").value) }),
+    }).then((r) => r.json()).then((d) => {
+      if (!d.ok) $("stat-note").textContent = "\u26a0 " + (d.error || "audit failed");
+      else fetchAuditReport();
+    }).catch(() => {});
   };
 
   // ---- bookmarks ----
@@ -562,6 +579,46 @@ function wireControls() {
     }
     agentConfigSave(patch, () => { $("ag-llm-key").value = ""; });
   };
+
+  // ---- v1.7: scheduled-sweep change digest ----
+  $("dg-hour").addEventListener("change", (e) => {
+    const v = e.target.value;
+    agentConfigSave({ digest_enabled: v !== "",
+                      digest_hour: v === "" ? 9 : parseInt(v, 10) });
+  });
+  $("dg-email").addEventListener("change", (e) => {
+    agentConfigSave({ digest_email_enabled: e.target.checked });
+  });
+  $("dg-save").onclick = () => {
+    const patch = {
+      digest_smtp_host: $("dg-host").value.trim(),
+      digest_smtp_port: parseInt($("dg-port").value, 10) || 587,
+      digest_smtp_user: $("dg-user").value.trim(),
+      digest_email_from: $("dg-from").value.trim(),
+      digest_email_to: $("dg-to").value.trim(),
+    };
+    if ($("dg-pass").value.trim()) patch.digest_smtp_pass = $("dg-pass").value.trim();
+    agentConfigSave(patch, () => { $("dg-pass").value = ""; });
+  };
+  $("dg-build").onclick = async () => {
+    const d = await postJson("/api/digest/build", {});
+    if (d && d.ok) {
+      $("dg-text").textContent = d.text;
+      toast("Digest built", d.day + " \u00b7 " + (d.path ? "saved to the data folder" : ""));
+    } else {
+      $("stat-note").textContent = "\u26a0 " + ((d && d.error) || "digest build failed");
+    }
+  };
+  $("dg-send").onclick = async () => {
+    const d = await postJson("/api/digest/build", { send: true });
+    if (d && d.ok) {
+      $("dg-text").textContent = d.text;
+      toast(d.emailed ? "Digest emailed" : "Digest built, email not sent",
+            d.emailed ? d.day : (d.email_note || "check the mail settings"));
+    } else {
+      $("stat-note").textContent = "\u26a0 " + ((d && d.error) || "digest send failed");
+    }
+  };
 }
 
 // -------------------------------------------------------------- agent (v1.5)
@@ -584,6 +641,14 @@ function applyAgentStatus(ag, force) {
       document.activeElement !== $("am-sens")) {
     $("am-sens").value = ag.am_sensitivity;
   }
+  // v1.7: audit dwell + digest schedule (skip while the user edits them)
+  if (ag.audit_dwell_s && document.activeElement !== $("audit-dwell")) {
+    const v = String(ag.audit_dwell_s);
+    if ([...$("audit-dwell").options].some((o) => o.value === v)) {
+      $("audit-dwell").value = v;
+    }
+  }
+  applyDigestStatus(ag);
   if (ag.llm.base_url && !$("ag-llm-url").value) {
     $("ag-llm-url").value = ag.llm.base_url;
   }
@@ -603,6 +668,42 @@ function applyAgentStatus(ag, force) {
     txt += " · " + sch.last_note;
   }
   $("ag-status").textContent = txt;
+}
+
+// ------------------------------------------------------------ digest (v1.7)
+// The digest block of the agent status; the full text is fetched from
+// /api/digest when the user expands the section (kept out of /api/status).
+let dgFetched = null;
+function applyDigestStatus(ag) {
+  const dg = ag.digest;
+  if (!dg) return;
+  const sel = $("dg-hour");
+  if (document.activeElement !== sel) {
+    sel.value = dg.enabled ? String(dg.hour) : "";
+  }
+  if (document.activeElement !== $("dg-email")) {
+    $("dg-email").checked = !!dg.email_enabled;
+  }
+  let txt;
+  if (!dg.enabled) {
+    txt = "daily digest off";
+  } else {
+    txt = "daily digest " + String(dg.hour).padStart(2, "0") + ":00";
+    if (dg.email_enabled) {
+      txt += dg.email_configured ? " · email on" : " · email on (missing host/to!)";
+    }
+    if (dg.next_run_in_s != null) txt += " · next " + fmtDur(dg.next_run_in_s);
+  }
+  if (dg.last_note && dg.last_note !== "never built") txt += " · " + dg.last_note;
+  $("dg-status").textContent = txt;
+  // load the last digest text once per day (or when a new build appears)
+  if (dg.last_built && dg.last_built !== dgFetched) {
+    dgFetched = dg.last_built;
+    fetch("/api/digest?day=" + encodeURIComponent(dg.last_built))
+      .then((r) => r.json())
+      .then((d) => { if (d.ok) $("dg-text").textContent = d.text; })
+      .catch(() => {});
+  }
 }
 
 function agentChatLine(who, text) {
@@ -1253,7 +1354,15 @@ function updateScan(ev) {
   S.scanRunning = !!sc.running;
   S.scanMode = sc.mode || "live";
   const stateEl = $("scan-state");
-  if (sc.running && sc.mode === "sweep") {
+  if (sc.running && sc.mode === "audit") {
+    const pct = sc.count ? Math.round((sc.idx / sc.count) * 100) : 0;
+    stateEl.textContent = "auditing " + (sc.idx + 1) + "/" + sc.count +
+      " (" + pct + "%)";
+    stateEl.className = "scan-state run";
+  } else if (!sc.running && sc.state === "done" && sc.mode === "audit") {
+    stateEl.textContent = "audit done \u00b7 " + (sc.results || 0) + " stations";
+    stateEl.className = "scan-state hold";
+  } else if (sc.running && sc.mode === "sweep") {
     const pct = sc.count ? Math.round((sc.idx / sc.count) * 100) : 0;
     stateEl.textContent = "sweeping " + (sc.idx + 1) + "/" + sc.count +
       " (" + pct + "%)";
@@ -1279,6 +1388,7 @@ function updateScan(ev) {
   }
   $("scan-btn").textContent = (sc.running && sc.mode !== "sweep") ? "Stop" : "Scan";
   $("sweep-btn").textContent = (sc.running && sc.mode === "sweep") ? "Stop" : "All bands";
+  $("audit-btn").textContent = (sc.running && sc.mode === "audit") ? "Stop" : "RDS audit";
 
   // v1.6: AM adaptive-sensitivity readout
   const af = $("am-floor");
@@ -1304,6 +1414,15 @@ function updateScan(ev) {
     if (now - S.sweepFetchT > 2000) {
       S.sweepFetchT = now;
       refreshSweepResults();
+    }
+  }
+
+  // while an audit runs (and shortly after), pull the partial report
+  if (sc.mode === "audit") {
+    const now = performance.now();
+    if (now - S.auditFetchT > 3000) {
+      S.auditFetchT = now;
+      fetchAuditReport();
     }
   }
 
@@ -1493,6 +1612,58 @@ async function renameStation(slot) {
       renderStations();
     }
   } catch { /* server gone; pollStatus will resync */ }
+}
+
+// ------------------------------------------------------------ RDS audit (v1.7)
+async function fetchAuditReport() {
+  try {
+    const d = await (await fetch("/api/audit/report")).json();
+    renderAuditReport(d.report || null, d.audit || null);
+  } catch { /* server gone; pollStatus will resync */ }
+}
+
+function renderAuditReport(rep, audit) {
+  const el = $("audit-results");
+  const sum = $("audit-summary");
+  if (!el) return;
+  const rows = (rep && rep.results) || [];
+  const running = !!(audit && audit.running);
+  if (!rows.length && !running) {
+    sum.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  if (rep) {
+    const when = new Date(rep.t * 1000).toLocaleString([],
+      { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+    const avg = rep.avg_score != null ? rep.avg_score.toFixed(0) : "\u2014";
+    sum.hidden = false;
+    sum.textContent = "RDS AUDIT \u00b7 " + when + " \u00b7 " + rep.channels +
+      " ch \u00b7 " + (rep.dwell_s || 5) + "s each \u00b7 avg score " + avg +
+      (rep.worst ? " \u00b7 weakest: " + rep.worst : "");
+  }
+  const scoreCls = (s) => s >= 70 ? "good" : s >= 40 ? "mid" : "low";
+  el.innerHTML = rows.slice(0, 12).map((r) => {
+    const freq = (r.freq_hz / 1e6).toFixed(2);
+    const ps = (r.ps_complete ? "\u2713 " : "") + (r.ps || "\u2014");
+    const ber = r.ber != null ? (r.ber * 100).toFixed(0) + "%" : "\u2014";
+    const gps = r.groups_per_s != null ? r.groups_per_s.toFixed(1) : "\u2014";
+    return '<div class="audit-item" data-band="wfm" data-hz="' + r.freq_hz +
+      '"><span class="ar-name">' + escapeHtml(r.name || "?") + "</span>" +
+      '<span class="ar-freq">' + freq + "</span>" +
+      '<span class="ar-pi">' + escapeHtml(r.pi || "\u2014") + "</span>" +
+      '<span class="ar-ps">' + escapeHtml(ps) + "</span>" +
+      '<span class="ar-pty">' + escapeHtml(r.pty || "") + "</span>" +
+      '<span class="ar-stat">' + gps + " g/s \u00b7 " + ber + "</span>" +
+      '<span class="ar-score ' + scoreCls(r.score) + '">' +
+      (r.score != null ? r.score.toFixed(0) : "\u2014") + "</span></div>";
+  }).join("");
+  el.querySelectorAll(".audit-item").forEach((row) => {
+    row.onclick = () => {
+      S.mode = null;
+      tuneTo("wfm", parseInt(row.dataset.hz, 10));
+    };
+  });
 }
 
 // ------------------------------------------------------------ sweep results

@@ -30,6 +30,7 @@ import numpy as np
 from . import agent as agent_mod
 from . import config as cfg
 from . import device as devmod
+from . import digest as digest_mod
 from . import dsp
 from . import pi_db as pi_db_mod
 
@@ -44,6 +45,10 @@ class ReceiverEngine:
         self.prefer_sim = prefer_sim
         self.device = None
         self.info = {}
+        # v1.7: every runtime artifact resolves here (empty = next to
+        # app.py, as before; Docker sets it to the mounted volume)
+        self._data_dir = conf.get("data_dir") or cfg.ROOT
+        self._state_dir = os.path.join(self._data_dir, "state")
         self.band = conf["default_band"]
         self.freq = cfg.clamp_to_band(conf["default_freq_hz"], self.band)
         self.mode = None                # None -> band default
@@ -85,24 +90,21 @@ class ReceiverEngine:
         self.ctcss_hz = 0.0
 
         # station/scan memory: {"freqs": {hz_str: {hz, hits, last}}}
-        self._mem_path = os.path.join(cfg.ROOT,
-                                      conf.get("scan_memory_file",
-                                               "scan_memory.json"))
+        self._mem_path = self._data_file(
+            conf.get("scan_memory_file", "scan_memory.json"))
         self.memory = self._load_memory()
 
         # SDR#-style bookmarks: [{id, name, band, freq_hz, mode, added}]
-        self._bmk_path = os.path.join(cfg.ROOT,
-                                      conf.get("bookmarks_file",
-                                               "bookmarks.json"))
+        self._bmk_path = self._data_file(
+            conf.get("bookmarks_file", "bookmarks.json"))
         self.bookmarks = self._load_bookmarks()
         self._bmk_seq = max([int(b.get("id", 0)) for b in self.bookmarks],
                             default=0)
 
         # v1.4: the 20 named station presets ("STATIONS" panel). Each slot
         # is {slot, name, band, freq_hz, mode} or None when empty.
-        self._st_path = os.path.join(cfg.ROOT,
-                                     conf.get("stations_file",
-                                              "stations.json"))
+        self._st_path = self._data_file(
+            conf.get("stations_file", "stations.json"))
         self.stations = self._load_stations()
 
         # v1.6: change feed for browser notifications. Every mutation of
@@ -114,22 +116,28 @@ class ReceiverEngine:
         self._pi_thread = None
 
         # v1.4: last all-band sweep results (persisted, feeds "fill presets")
-        self._sweep_path = os.path.join(cfg.ROOT,
-                                        conf.get("sweep_results_file",
-                                                 "sweep_results.json"))
+        self._sweep_path = self._data_file(
+            conf.get("sweep_results_file", "sweep_results.json"))
         self.sweep_results = self._load_sweep_results()
         self.sweep_meta = {"t": None, "bands": None}
 
         # v1.5: agent layer — scheduled background re-sweeps, LLM naming,
         # natural-language commands. Settings persist to agent_config.json.
-        self._agent_path = os.path.join(cfg.ROOT,
-                                        conf.get("agent_config_file",
-                                                 "agent_config.json"))
+        self._agent_path = self._data_file(
+            conf.get("agent_config_file", "agent_config.json"))
         self.agent = self._load_agent_config()
         self._sched = {"next_t": None, "last_run": None,
                        "last_note": "never ran", "sweeping": False}
         self._sched_stop = threading.Event()
         self._sched_thread = None
+
+        # v1.7: scheduled-sweep change digest (journal -> daily text/email)
+        self._digest = digest_mod.DigestJournal(self._state_dir)
+        self._digest_store = digest_mod.DigestStore(self._state_dir)
+        self._digest_state = {"next_t": None, "last_built": None,
+                              "last_note": "never built"}
+        # v1.7: spectrum-wide RDS audit (latest report metadata)
+        self._audit_meta = {"last_t": None, "count": 0, "note": "never run"}
 
         # scanner state
         #   mode "live"  - hop/hold on squelch activity (v1.1 behaviour)
@@ -146,16 +154,28 @@ class ReceiverEngine:
             "bands": [], "threshold_db": None, "dwell": 0.35,
             "rds_wait": 1.6, "cur_db": None, "rds_name": None,
             "rds_pi": None, "restore": None, "t0": None,
+            "trigger": "manual",
+            # v1.7 audit-only fields
+            "audit_cur": None,
         }
 
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
+    def _data_file(self, name):
+        """Runtime artifact path inside the data root (v1.7 data_dir)."""
+        return os.path.join(self._data_dir, name)
+
     def start(self):
         if self.started:
             return
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            os.makedirs(self._state_dir, exist_ok=True)
+        except OSError:
+            pass
         self.device, self.info = devmod.open_device(prefer_sim=self.prefer_sim)
-        pi_db_mod.init_cache(os.path.join(cfg.ROOT, "pi_cache.json"))
+        pi_db_mod.init_cache(self._data_file("pi_cache.json"))
         self._apply_device_config()
         self._demod = self._make_demod()
         self._stop.clear()
@@ -193,12 +213,14 @@ class ReceiverEngine:
     def tune(self, band=None, freq_hz=None, mode=None):
         with self._lock:
             if self._scan["running"]:
-                # manual tune wins over scanner/sweep; a sweep keeps the
-                # partial results but does not yank the tuner back
+                # manual tune wins over scanner/sweep/audit; a measurement
+                # keeps the partial results but does not yank the tuner back
                 self._scan["running"] = False
                 self._scan["state"] = "idle"
                 if self._scan["mode"] == "sweep":
                     self._close_sweep(save=True, restore=None)
+                elif self._scan["mode"] == "audit":
+                    self._close_audit(save=True, restore=None)
             band = band or self.band
             if band not in cfg.BANDS:
                 raise ValueError(f"unknown band: {band}")
@@ -292,7 +314,8 @@ class ReceiverEngine:
         return {"ok": True, "list": list_name, "order": order}
 
     def start_sweep(self, bands=None, threshold_db=None, dwell_s=None,
-                    from_hz=None, to_hz=None, am_sensitivity=None):
+                    from_hz=None, to_hz=None, am_sensitivity=None,
+                    trigger="manual"):
         """All-band measurement sweep (v1.4, AM sensitivity v1.6).
 
         Tunes across every channel of the selected bands, records the peak
@@ -350,7 +373,7 @@ class ReceiverEngine:
                 "bands": ordered, "threshold_db": thr, "dwell": dwell,
                 "rds_wait": float(self.conf["sweep_rds_wait_s"]),
                 "restore": (self.band, self.freq), "t0": time.time(),
-                "results": [],
+                "results": [], "trigger": trigger,
                 # v1.6: adaptive AM sensitivity (noise-floor probe pass)
                 "am_sens": am_sens if am_chans else None,
                 "am_probe_chans": am_chans,
@@ -361,6 +384,52 @@ class ReceiverEngine:
         return {"ok": True, "bands": ordered, "channels": len(chans),
                 "threshold_db": thr, "dwell_s": dwell,
                 "am_sensitivity": am_sens}
+
+    def start_audit(self, freqs=None, dwell_s=None):
+        """Spectrum-wide RDS audit (v1.7).
+
+        Dwells on each known FM carrier and scores its RDS reception:
+        PI stability, PS completeness, programme type, RadioText, group
+        rate and block-error ratio combine into a 0-100 quality score.
+        Default scope: every station of the last sweep plus the FM
+        presets; pass freqs for a custom set. Audio is muted while
+        auditing; the previous tuning is restored at the end (or on
+        stop / manual tune, keeping the partial report).
+        """
+        with self._lock:
+            if self._scan["running"]:
+                raise ValueError(
+                    "a scan/sweep/audit is already running - stop it first")
+            dwell = (float(dwell_s) if dwell_s is not None
+                     else float(self.conf["audit_dwell_s"]))
+            dwell = max(1.0, min(30.0, dwell))
+            if freqs:
+                chans = [("wfm", cfg.clamp_to_band(int(f), "wfm"))
+                         for f in freqs]
+                chans = list(dict.fromkeys(chans))
+            else:
+                seen = [int(r["freq_hz"]) for r in self._dedupe_results(
+                    [r for r in (self.sweep_results or [])
+                     if r.get("band") == "wfm" and r.get("db") is not None])]
+                for st in self.stations:
+                    if (st and st.get("band") == "wfm"
+                            and not any(abs(int(st["freq_hz"]) - f) < 500
+                                        for f in seen)):
+                        seen.append(int(st["freq_hz"]))
+                chans = [("wfm", f) for f in sorted(set(seen))]
+            chans = chans[:80]   # safety valve: 206 ch x 30 s would run 1.7 h
+            if not chans:
+                raise ValueError(
+                    "no FM stations known - run a sweep first, or pass freqs")
+            self._begin_scan(mode="audit", chans=chans, list_name=None,
+                             label="RDS audit", order="linear")
+            self._scan.update({
+                "dwell": dwell, "rds_wait": 0.0,
+                "restore": (self.band, self.freq), "t0": time.time(),
+                "results": [], "trigger": "manual", "audit_cur": None,
+            })
+        return {"ok": True, "channels": len(chans), "dwell_s": dwell,
+                "seconds_est": round(len(chans) * (dwell + 0.45))}
 
     def _begin_scan(self, mode, chans, list_name, label, order):
         """Common scan/sweep setup (lock held by caller)."""
@@ -381,12 +450,24 @@ class ReceiverEngine:
             if not self._scan["running"]:
                 self._scan["state"] = "idle"
                 return
-            was_sweep = self._scan["mode"] == "sweep"
-            restore = self._scan.get("restore") if was_sweep else None
+            mode = self._scan["mode"]
+            restore = self._scan.get("restore") \
+                if mode in ("sweep", "audit") else None
             self._scan["running"] = False
             self._scan["state"] = "idle"
-            if was_sweep:
+            if mode == "sweep":
                 self._close_sweep(save=True, restore=restore)
+            elif mode == "audit":
+                self._close_audit(save=True, restore=restore)
+
+    def stop_audit(self):
+        """Stop the running audit only (a sweep/scan is left untouched).
+        Returns True when an audit was actually stopped."""
+        with self._lock:
+            if not (self._scan["running"] and self._scan["mode"] == "audit"):
+                return False
+        self.stop_scan()
+        return True
 
     def scan_status(self):
         with self._lock:
@@ -410,6 +491,9 @@ class ReceiverEngine:
                 "memory": self.memory_list(),
                 "results": len(sc.get("results", [])),
                 "bands": sc.get("bands") or [],
+                "trigger": sc.get("trigger"),
+                "dwell_s": (round(float(sc.get("dwell") or 0), 1)
+                            if sc["mode"] in ("sweep", "audit") else None),
                 "am_sens": sc.get("am_sens"),
                 "am_floor_db": sc.get("am_floor_db"),
                 "am_thr_db": sc.get("am_thr_db"),
@@ -669,6 +753,11 @@ class ReceiverEngine:
             "t": round(time.time(), 1), "source": source,
             "added": added, "removed": removed, "renamed": renamed,
         }
+        try:
+            self._digest.record("stations", source=source, added=added,
+                                removed=removed, renamed=renamed)
+        except Exception:
+            pass                  # the digest journal never breaks presets
 
     def fill_stations_from_sweep(self, count=None, keep_locked=True,
                                  source="fill"):
@@ -856,6 +945,10 @@ class ReceiverEngine:
             "am_sensitivity": a.get("am_sensitivity") or "medium",
             "pi_lookup_enabled": bool(a.get("pi_lookup_enabled", True)),
             "pi_lookup_url": a.get("pi_lookup_url") or "",
+            # v1.7
+            "audit_dwell_s": float(a.get("audit_dwell_s") or 5.0),
+            "digest": {k: v for k, v in self.digest_status().items()
+                       if k != "days"},
         }
 
     def set_agent_settings(self, patch):
@@ -894,6 +987,30 @@ class ReceiverEngine:
             a["pi_lookup_enabled"] = bool(patch["pi_lookup_enabled"])
         if "pi_lookup_url" in patch:
             a["pi_lookup_url"] = str(patch["pi_lookup_url"] or "").strip()
+        # v1.7: RDS audit dwell + scheduled-sweep change digest
+        if "audit_dwell_s" in patch:
+            v = float(patch["audit_dwell_s"] or 5.0)
+            if not 1.0 <= v <= 30.0:
+                raise ValueError("audit dwell must be 1-30 seconds")
+            a["audit_dwell_s"] = v
+        for k in ("digest_enabled", "digest_email_enabled"):
+            if k in patch:
+                a[k] = bool(patch[k])
+        if "digest_hour" in patch:
+            v = int(patch["digest_hour"])
+            if not 0 <= v <= 23:
+                raise ValueError("digest hour must be 0-23")
+            a["digest_hour"] = v
+        if "digest_smtp_port" in patch:
+            v = int(patch["digest_smtp_port"] or 587)
+            if not 1 <= v <= 65535:
+                raise ValueError("SMTP port out of range")
+            a["digest_smtp_port"] = v
+        for k in ("digest_smtp_host", "digest_smtp_user",
+                  "digest_smtp_pass", "digest_email_from",
+                  "digest_email_to"):
+            if k in patch:
+                a[k] = str(patch[k] or "").strip()
         with self._lock:
             self.agent = a
             self._save_agent_config()
@@ -902,6 +1019,14 @@ class ReceiverEngine:
                 self._sched["next_t"] = None
             else:
                 self._sched["next_t"] = time.time() + interval * 60
+            # v1.7: re-arm the digest schedule immediately so the UI sees
+            # next_run_in_s without waiting for the next scheduler tick
+            if a.get("digest_enabled"):
+                self._digest_state["next_t"] = digest_mod.next_daily_run(
+                    time.time(), max(0, min(23, int(a.get("digest_hour")
+                                                   or 9))))
+            else:
+                self._digest_state["next_t"] = None
         return self.agent_status()
 
     def _scheduler_loop(self):
@@ -913,6 +1038,14 @@ class ReceiverEngine:
                     with self._lock:
                         self._sched["last_note"] = \
                             f"scheduler error: {exc}"
+                except Exception:
+                    pass
+            try:
+                self._digest_tick(time.time())
+            except Exception as exc:      # the digest must never kill ticks
+                try:
+                    self._digest_state["last_note"] = \
+                        f"digest error: {exc}"
                 except Exception:
                     pass
 
@@ -945,7 +1078,8 @@ class ReceiverEngine:
                 sched["next_t"] = now + 60
             return
         try:
-            res = self.start_sweep(bands=a.get("sweep_bands"))
+            res = self.start_sweep(bands=a.get("sweep_bands"),
+                                   trigger="scheduled")
             with self._lock:
                 sched["sweeping"] = True
                 sched["last_run"] = now
@@ -955,6 +1089,106 @@ class ReceiverEngine:
             with self._lock:
                 sched["last_note"] = f"scheduled sweep failed: {exc}"
                 sched["next_t"] = now + 300
+
+    # ------------------------------------------------------------------
+    # v1.7: scheduled-sweep change digest (daily log/email summary)
+    # ------------------------------------------------------------------
+    def _digest_tick(self, now):
+        """Daily digest scheduler: build yesterday's digest at the
+        configured local hour, catch up a missed day after downtime, and
+        email it when the agent settings say so. Runs on the scheduler
+        thread; never raises."""
+        with self._lock:
+            a = dict(self.agent)
+        st = self._digest_state
+        if not a.get("digest_enabled"):
+            st["next_t"] = None
+            return
+        hour = max(0, min(23, int(a.get("digest_hour") or 9)))
+        if st.get("next_t") is None:
+            st["next_t"] = digest_mod.next_daily_run(now, hour)
+        # catch-up: the scheduled hour passed while the app was off and
+        # that day still has journal events but no built digest
+        for day in (digest_mod.local_day(now - 86400),
+                    digest_mod.local_day(now)):
+            built_at = digest_mod.day_start_ts(day) + hour * 3600
+            if (now >= built_at and not self._digest_store.exists(day)
+                    and self._digest.for_day(day)):
+                self._run_daily_digest(day, now=now, note="catch-up")
+                break
+        if now < st.get("next_t", now):
+            return
+        st["next_t"] = digest_mod.next_daily_run(now + 3600, hour)
+        self._run_daily_digest(digest_mod.local_day(now - 86400), now=now)
+
+    def _run_daily_digest(self, day, now=None, note="scheduled",
+                          force_email=None):
+        """Build (+ optionally email) the digest for one local day.
+        force_email: None = follow the agent setting (scheduler path);
+        True/False = explicit from the API."""
+        with self._lock:
+            a = dict(self.agent)
+        text = digest_mod.format_digest(day, self._digest.for_day(day))
+        path = self._digest_store.save(day, text)
+        st = self._digest_state
+        st["last_built"] = day
+        note_txt = f"{note}: digest {day} written"
+        emailed, email_note = False, None
+        want_email = (a.get("digest_email_enabled")
+                      if force_email is None else force_email)
+        if want_email:
+            ok, email_note = digest_mod.send_email(
+                a, f"RTL-SDR Player digest {day}", text)
+            emailed = ok
+            note_txt += " · " + email_note
+        st["last_note"] = note_txt
+        return {"ok": True, "day": day, "text": text, "path": path,
+                "emailed": emailed, "email_note": email_note}
+
+    def digest_status(self):
+        with self._lock:
+            a = dict(self.agent)
+            st = dict(self._digest_state)
+        enabled = bool(a.get("digest_enabled"))
+        return {
+            "enabled": enabled,
+            "hour": max(0, min(23, int(a.get("digest_hour") or 9))),
+            "next_run_in_s": (max(0, round(st["next_t"] - time.time()))
+                              if enabled and st.get("next_t") else None),
+            "last_built": st.get("last_built"),
+            "last_note": st.get("last_note"),
+            "email_enabled": bool(a.get("digest_email_enabled")),
+            "email_configured": digest_mod.email_configured(a),
+            "days": self._digest_store.days()[:14],
+        }
+
+    def build_digest(self, day=None, send=False):
+        """API-facing digest build: today (or a given YYYY-MM-DD),
+        optionally emailed right now regardless of the schedule."""
+        day = str(day or digest_mod.local_day())
+        try:
+            time.strptime(day, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("day must be YYYY-MM-DD")
+        return self._run_daily_digest(day, note="manual",
+                                      force_email=bool(send))
+
+    def get_digest(self, day=None):
+        """Return a built digest (building it on the fly when the journal
+        has events for that day but no digest was built yet)."""
+        day = str(day or digest_mod.local_day())
+        try:
+            time.strptime(day, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("day must be YYYY-MM-DD")
+        text = self._digest_store.get(day)
+        built = text is not None
+        if text is None and self._digest.for_day(day):
+            text = digest_mod.format_digest(day, self._digest.for_day(day))
+            self._digest_store.save(day, text)
+        if text is None:
+            text = digest_mod.format_digest(day, [])
+        return {"ok": True, "day": day, "text": text, "built": built}
 
     def _sub_count(self):
         with self._lock:
@@ -986,6 +1220,10 @@ class ReceiverEngine:
                     notes.append(f"AI named {res['updated']} presets")
             except Exception as exc:
                 notes.append(f"AI naming failed: {exc}")
+        try:
+            self._digest.record("scheduled_notes", notes=notes)
+        except Exception:
+            pass
         with self._lock:
             sched["last_note"] = "sweep done: " + \
                 (", ".join(notes) if notes else
@@ -1021,6 +1259,10 @@ class ReceiverEngine:
             old = self.stations
             self._save_stations()
         self._commit_stations(old, "AI naming")
+        try:
+            self._digest.record("ai_named", updated=len(updated))
+        except Exception:
+            pass
         return {"ok": True, "updated": len(updated)}
 
     # ------------------------------------------------------------------
@@ -1074,6 +1316,10 @@ class ReceiverEngine:
                         self._commit_stations(old, "PI lookup")
             if named:
                 self._save_sweep_results(self.sweep_meta)
+                try:
+                    self._digest.record("pi_lookup", named=named)
+                except Exception:
+                    pass
         except Exception:
             pass  # enrichment is best-effort; never break the receiver
 
@@ -1182,6 +1428,8 @@ class ReceiverEngine:
                 "stations_rev": self._stations_rev,
                 "stations_change": self._stations_change,
                 "agent": self.agent_status(),
+                "digest": self.digest_status(),
+                "audit": self.audit_status(),
                 "target_buffer_ms": int(self.conf["audio_target_buffer_s"] * 1000),
                 "started": self.started,
                 "capture": {
@@ -1276,7 +1524,7 @@ class ReceiverEngine:
         self.gen += 1
 
     def _hop_scan(self):
-        """Advance the scanner/sweep to the next channel (lock held)."""
+        """Advance the scanner/sweep/audit to the next channel (lock held)."""
         sc = self._scan
         sc["idx"] += 1
         if sc["idx"] >= len(sc["chans"]):
@@ -1284,6 +1532,11 @@ class ReceiverEngine:
             if sc["mode"] == "sweep":
                 self._close_sweep(save=True,
                                   restore=sc.get("restore"))
+                sc["running"] = False
+                sc["state"] = "done"
+                return
+            if sc["mode"] == "audit":
+                self._close_audit(save=True, restore=sc.get("restore"))
                 sc["running"] = False
                 sc["state"] = "done"
                 return
@@ -1307,6 +1560,8 @@ class ReceiverEngine:
             return False
         if sc["mode"] == "sweep":
             return self._sweep_step(now)
+        if sc["mode"] == "audit":
+            return self._audit_step(now)
         dwell = float(self.conf["scan_dwell_s"])
         release = float(self.conf["scan_release_s"])
         measured = self.gen >= sc["hop_gen"]
@@ -1475,6 +1730,210 @@ class ReceiverEngine:
             self._pending = ("tune", restore[0], restore[1])
         if results:
             self._maybe_start_pi_enrich()
+        try:
+            self._digest.record(
+                "sweep", trigger=sc.get("trigger") or "manual",
+                bands=sc.get("bands"), found=len(results),
+                am_floor_db=sc.get("am_floor_db"),
+                seconds=((time.time() - sc["t0"]) if sc.get("t0") else None))
+        except Exception:
+            pass                      # the digest journal never breaks sweeps
+
+    # ------------------------------------------------------------------
+    # v1.7: spectrum-wide RDS audit
+    # ------------------------------------------------------------------
+    def _audit_step(self, now):
+        """One processed block in audit mode (lock held by caller).
+
+        Accumulates the RDS decoder output of the current channel for the
+        whole dwell window: PI codes seen (with counts), the best PS state
+        reached, programme type, RadioText, clock, pilot presence, peak
+        channel power, and the group/error counters of the decoder (their
+        deltas give group rate and an approximate block-error ratio).
+        """
+        sc = self._scan
+        if sc["idx"] >= len(sc["chans"]):
+            return False
+        cur = sc.get("audit_cur")
+        if cur is None or cur.get("freq") != sc["freq_hz"]:
+            cur = {"freq": sc["freq_hz"], "pis": {}, "ps": None,
+                   "ps_missing": 9, "pty": None, "tp": None, "ta": None,
+                   "rt": None, "clock": None, "groups0": None,
+                   "groups1": 0, "errors1": 0, "db": None, "pilot": False}
+            sc["audit_cur"] = cur
+        settled = self.gen >= sc["hop_gen"]
+        if settled:
+            if self.chan_db is not None \
+                    and (cur["db"] is None or self.chan_db > cur["db"]):
+                cur["db"] = float(self.chan_db)
+            snap = self.current_rds()
+            if snap:
+                cur["pilot"] = bool(cur["pilot"] or snap.get("pilot"))
+                if snap.get("pi"):
+                    cur["pis"][snap["pi"]] = \
+                        cur["pis"].get(snap["pi"], 0) + 1
+                if snap.get("groups"):
+                    if cur["groups0"] is None:
+                        cur["groups0"] = snap["groups"]
+                    cur["groups1"] = snap["groups"]
+                    cur["errors1"] = snap.get("errors") or 0
+                miss = snap.get("ps_missing", 9)
+                if snap.get("ps"):
+                    cur["ps"] = snap["ps"]
+                    cur["ps_missing"] = 0
+                elif (snap.get("ps_partial") and miss < cur["ps_missing"]):
+                    cur["ps"] = snap["ps_partial"]
+                    cur["ps_missing"] = miss
+                for k in ("pty", "tp", "ta", "clock"):
+                    if cur.get(k) is None and snap.get(k) is not None:
+                        cur[k] = snap[k]
+                if cur.get("rt") is None and snap.get("radiotext"):
+                    cur["rt"] = snap["radiotext"]
+        if now - sc["hop_t"] < float(sc["dwell"]):
+            return True              # muted while auditing
+        self._audit_record(cur)
+        self._hop_scan()
+        return True
+
+    def _audit_record(self, cur):
+        """Finalize one audited channel: quality score + report row."""
+        sc = self._scan
+        dwell = max(0.5, float(sc["dwell"]))
+        groups = max(0, int(cur.get("groups1") or 0)
+                     - int(cur.get("groups0") or 0))
+        errors = max(0, int(cur.get("errors1") or 0))
+        blocks = groups * 4 + errors
+        ber = (errors / blocks) if blocks else None
+        gps = groups / dwell
+        pis = cur.get("pis") or {}
+        pi = max(pis, key=pis.get) if pis else None
+        pi_total = sum(pis.values())
+        pi_stab = (pis[pi] / pi_total) if pi and pi_total else 0.0
+        ps = cur.get("ps")
+        ps_complete = bool(ps) and cur.get("ps_missing", 9) == 0
+        # score: identity (PI) + complete name dominate, then programme
+        # type, RadioText, healthy group rate and a clean block stream
+        score = 0.0
+        if pi:
+            score += 30.0 * pi_stab if pi_total > 1 else 30.0
+        if ps_complete:
+            score += 25.0
+        elif ps:
+            score += 12.0
+        if cur.get("pty"):
+            score += 8.0
+        if cur.get("rt"):
+            score += 4.0
+        score += min(15.0, gps / 0.6)   # ~9 groups/s saturates
+        if ber is not None:
+            score += max(0.0, 18.0 * (1.0 - ber / 0.3))
+        score = round(min(100.0, score), 1)
+        name = ps
+        if not name:
+            for r in self.sweep_results or []:
+                if (r.get("band") == "wfm"
+                        and abs(int(r["freq_hz"]) - cur["freq"]) < 500):
+                    name = r.get("name")
+                    break
+        rec = {
+            "band": "wfm", "freq_hz": int(cur["freq"]),
+            "name": (name or
+                     self._default_station_name("wfm", cur["freq"]))[:32],
+            "pi": pi,
+            "pi_stability": (round(pi_stab, 2) if pi_total > 1 else None),
+            "ps": ps, "ps_complete": ps_complete,
+            "pty": cur.get("pty"), "tp": cur.get("tp"),
+            "ta": cur.get("ta"), "radiotext": cur.get("rt"),
+            "clock": cur.get("clock"), "pilot": bool(cur["pilot"]),
+            "db": (round(cur["db"], 1)
+                   if cur.get("db") is not None else None),
+            "groups": groups, "groups_per_s": round(gps, 2),
+            "ber": round(ber, 3) if ber is not None else None,
+            "score": score,
+        }
+        sc.setdefault("results", []).append(rec)
+
+    def _close_audit(self, save=True, restore=None):
+        """Finish an audit: persist the report, restore tuning (lock held
+        by caller). Called on natural completion, stop and manual-tune
+        interrupts; partial reports are kept."""
+        sc = self._scan
+        results = sc.get("results") or []
+        t0 = sc.get("t0")
+        if save and results:
+            scores = [r["score"] for r in results
+                      if isinstance(r.get("score"), (int, float))]
+            avg = (round(sum(scores) / len(scores), 1)
+                   if scores else None)
+            worst = (min(results, key=lambda r: r.get("score", 0))["name"]
+                     if results else None)
+            meta = {"t": time.time(), "dwell_s": sc.get("dwell"),
+                    "channels": len(results), "avg_score": avg,
+                    "worst": worst, "results": results}
+            self._audit_meta = {"last_t": meta["t"], "count": len(results),
+                                "note": (f"avg score {avg}" if avg is not None
+                                         else f"{len(results)} channels")}
+            self._save_audit(meta)
+            try:
+                self._digest.record(
+                    "audit", channels=len(results), avg_score=avg,
+                    worst=worst,
+                    seconds=((time.time() - t0) if t0 else None))
+            except Exception:
+                pass
+        sc["audit_cur"] = None
+        if restore:
+            self._pending = ("tune", restore[0], restore[1])
+
+    def _save_audit(self, meta):
+        """Persist an audit report: audit_latest.json + a stamped history
+        file, keeping the newest AUDIT_KEEP_COUNT."""
+        try:
+            adir = os.path.join(self._state_dir, "audits")
+            os.makedirs(adir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S",
+                                  time.localtime(meta["t"]))
+            for name in (f"{stamp}.json", "audit_latest.json"):
+                tmp = os.path.join(adir, name + ".tmp")
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(meta, fh, indent=1)
+                os.replace(tmp, os.path.join(adir, name))
+            olds = sorted(f for f in os.listdir(adir)
+                          if f.endswith(".json") and f != "audit_latest.json")
+            for f in olds[:-cfg.AUDIT_KEEP_COUNT]:
+                os.remove(os.path.join(adir, f))
+        except OSError:
+            pass                    # reports are a convenience; never break
+                                          # the capture loop
+
+    def audit_report(self):
+        """The latest audit report (dict) or None."""
+        path = os.path.join(self._state_dir, "audits", "audit_latest.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) \
+                    and isinstance(data.get("results"), list):
+                return data
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def audit_status(self):
+        with self._lock:
+            sc = self._scan
+            running = bool(sc["running"] and sc["mode"] == "audit")
+            return {
+                "running": running,
+                "idx": sc["idx"] if running else 0,
+                "count": len(sc["chans"]) if running else 0,
+                "dwell_s": (float(sc.get("dwell") or 0) if running
+                            else None),
+                "results": len(sc.get("results") or []),
+                "last_t": self._audit_meta.get("last_t"),
+                "last_count": self._audit_meta.get("count"),
+                "last_note": self._audit_meta.get("note"),
+            }
 
     def _reader_loop(self):
         while not self._stop.is_set():

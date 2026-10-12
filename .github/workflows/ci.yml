@@ -39,6 +39,12 @@ jobs:
       - name: Engine test (demods, squelch, scanner, SSB, memory)
         run: python tests/test_engine.py
 
+      - name: Digest unit tests (journal, builder, schedule, SMTP)
+        run: python tests/test_digest.py
+
+      - name: RDS audit test (engine-level, sim)
+        run: python tests/test_audit.py
+
   smoke:
     name: REST + WebSocket smoke test (sim server)
     runs-on: ubuntu-latest

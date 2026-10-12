@@ -537,6 +537,95 @@ async def main():
           f"{st['band']} {st['freq_hz']}")
     rest("/api/tune", {"band": "wfm", "freq_hz": 98_300_000})
 
+    # ---- 13. v1.7: RDS audit + scheduled-sweep change digest ----
+    r = rest("/api/digest/days")
+    check("digest days endpoint", r.get("ok") is True
+          and isinstance(r.get("days"), list), json.dumps(r)[:80])
+    r = rest("/api/digest/build", {})
+    check("digest build now", r.get("ok") is True and bool(r.get("text"))
+          and r.get("day"), str(r.get("day")))
+    r = json.loads(urllib.request.urlopen(BASE + "/api/digest",
+                                          timeout=5).read())
+    check("digest get endpoint", r.get("ok") is True
+          and bool(r.get("text")) and r.get("built") is True)
+    try:
+        rest("/api/digest/build", {"day": "banana"})
+        check("digest bad day rejected", False)
+    except urllib.error.HTTPError as exc:
+        check("digest bad day rejected", exc.code == 400,
+              f"HTTP {exc.code}")
+    try:
+        rest("/api/agent/config", {"digest_hour": 24})
+        check("digest hour validated", False)
+    except urllib.error.HTTPError as exc:
+        check("digest hour validated", exc.code == 400, f"HTTP {exc.code}")
+    r = rest("/api/agent/config", {"digest_enabled": True,
+                                   "digest_hour": 9})
+    dg = (r.get("agent") or {}).get("digest") or {}
+    check("digest enabled + status",
+          dg.get("enabled") is True and dg.get("hour") == 9
+          and dg.get("next_run_in_s") is not None,
+          json.dumps(dg)[:90])
+    st = rest("/api/status")
+    check("status carries digest+audit",
+          "digest" in st and "audit" in st
+          and "next_run_in_s" in st["digest"],
+          str(sorted(set(st["digest"]) | set(st["audit"]))[:6]))
+    rest("/api/agent/config", {"digest_enabled": False})
+
+    # audit: run over the single sim station, verify the report
+    # (wait for the section-12 restore tune to actually land first —
+    # start_audit snapshots the current tuning for its own restore)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        st = rest("/api/status")
+        if st["band"] == "wfm" and abs(st["freq_hz"] - 98_300_000) < 500:
+            break
+        await asyncio.sleep(0.3)
+    r = rest("/api/audit/start", {"freqs": [96_100_000], "dwell_s": 2.5})
+    check("audit starts", r.get("ok") is True and r.get("channels") == 1,
+          json.dumps(r)[:90])
+    rep = rest("/api/audit/report")
+    deadline = time.time() + 25
+    while time.time() < deadline and (rep.get("audit") or {}).get("running"):
+        await asyncio.sleep(0.4)
+        rep = rest("/api/audit/report")
+    rep_data = rep.get("report") or {}
+    rows = rep_data.get("results") or []
+    row = next((x for x in rows if x["freq_hz"] == 96_100_000), None)
+    check("audit completes with report", bool(row),
+          str([(x["freq_hz"], x.get("score")) for x in rows]))
+    check("audit scores the sim station",
+          bool(row) and row.get("pi") == "2A5B"
+          and row.get("ps_complete") is True and row.get("ps") == "SIM-RDS"
+          and row.get("score", 0) >= 60,
+          json.dumps(row or {})[:120])
+    st = rest("/api/status")
+    check("audit status shows result", st["audit"]["last_count"] == 1,
+          str(st["audit"]))
+    check("audit restore tuning", st["band"] == "wfm"
+          and abs(st["freq_hz"] - 98_300_000) < 500,
+          f"{st['band']} {st['freq_hz']}")
+    r = rest("/api/audit/stop", {})
+    check("audit stop when idle ok", r.get("ok") is True
+          and r.get("stopped") is False)
+    try:
+        rest("/api/audit/start", {"freqs": ["x"]})
+        check("audit bad freq rejected", False)
+    except urllib.error.HTTPError as exc:
+        check("audit bad freq rejected", exc.code == 400, f"HTTP {exc.code}")
+
+    # agent commands: audit + digest
+    r = rest("/api/agent/command", {"text": "audit rds"})
+    check("agent audit command", r.get("ok") is True
+          and r.get("action") == "audit", r.get("reply", "")[:60])
+    await asyncio.sleep(1.0)
+    rest("/api/audit/stop", {})
+    r = rest("/api/agent/command", {"text": "digest"})
+    check("agent digest command", r.get("ok") is True
+          and "DIGEST" in r.get("reply", ""), r.get("reply", "")[:60])
+    rest("/api/tune", {"band": "wfm", "freq_hz": 98_300_000})
+
     print()
     if fails:
         print("SMOKE TEST FAILURES:", fails)

@@ -1,0 +1,23 @@
+# Keep the image lean: dev artifacts, tests, runtime state
+__pycache__/
+*.pyc
+.git/
+.github/
+tests/
+scripts/
+*.log
+*.wav
+*.raw
+server*.log
+scan_memory*.json
+bookmarks*.json
+stations*.json
+sweep_results*.json
+agent_config.json
+pi_cache*.json
+state/
+audits/
+digests/
+.dockerignore
+Dockerfile
+docker-compose.yml

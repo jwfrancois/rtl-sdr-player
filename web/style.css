@@ -726,3 +726,69 @@ input[type="range"]::-moz-range-thumb {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
 }
+
+/* ---------- v1.7: RDS audit + scheduled-sweep change digest ---------- */
+.audit-row { margin-top: 2px; }
+.audit-summary {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: .04em;
+  color: var(--text-dim);
+  padding: 5px 2px 3px;
+}
+.audit-results { display: flex; flex-direction: column; gap: 2px; }
+.audit-item {
+  display: grid;
+  grid-template-columns: minmax(64px, 1.5fr) 44px 38px minmax(56px, 1.2fr) minmax(48px, 1fr) minmax(64px, 1fr) 30px;
+  gap: 5px;
+  align-items: baseline;
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: rgba(14, 20, 27, .55);
+  cursor: pointer;
+}
+.audit-item:hover { border-color: rgba(34, 211, 238, .4); }
+.audit-item .ar-name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.audit-item .ar-freq { color: var(--accent); }
+.audit-item .ar-pi { color: var(--text-dim); }
+.audit-item .ar-ps { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.audit-item .ar-pty { color: var(--text-faint); font-size: 9px; }
+.audit-item .ar-stat { color: var(--text-faint); font-size: 9px; text-align: right; }
+.audit-item .ar-score {
+  text-align: center;
+  font-weight: 700;
+  border-radius: 5px;
+  padding: 1px 0;
+}
+.audit-item .ar-score.good { color: #34d399; background: rgba(52, 211, 153, .12); }
+.audit-item .ar-score.mid  { color: #fbbf24; background: rgba(251, 191, 36, .10); }
+.audit-item .ar-score.low  { color: #f87171; background: rgba(248, 113, 113, .10); }
+
+/* digest block inside the agent panel */
+.ag-digest { margin-top: 9px; padding-top: 7px; border-top: 1px solid var(--border); }
+.ag-digest .ag-sched { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ag-digest .ag-sched select {
+  background: #0d1319;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 11px;
+  padding: 2px 4px;
+}
+.dg-text {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  background: #0a0f15;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 8px;
+  margin: 0 0 8px;
+  max-height: 180px;
+  overflow: auto;
+}

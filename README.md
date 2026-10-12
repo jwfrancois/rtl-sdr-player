@@ -19,6 +19,10 @@ Dongle → [this app] → http://localhost:8515
              │                           control, LLM station naming, dial report
              ├── Sound Studio (v1.6)     5-band EQ + compressor, presets auto-switched
              │                           by station type, output VU meter
+             ├── RDS audit (v1.7)        dwells on every FM carrier and scores its
+             │                           RDS reception (PI/PS/PTY/BER) 0-100
+             ├── Digest (v1.7)           daily summary of scheduled-sweep preset
+             │                           changes, plain-text log + optional email
              └── TV tab                  DVB-T capability detection + guide
                                          (Linux: full channel scan & playback)
 ```
@@ -94,6 +98,95 @@ python3 app.py
 
 macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 (radio works; TV does not).
+
+---
+
+## Setup (Ubuntu server / Docker)
+
+The repo ships a Dockerfile (Ubuntu 24.04 base) so the receiver can run
+headless on a server with the dongle plugged in:
+
+```bash
+# one-time host prep
+curl -fsSL https://get.docker.com | sudo sh        # or: sudo apt install docker.io docker-compose-v2
+sudo modprobe -r dvb_usb_rtl28xxu                  # free the stick for SDR mode
+echo 'blacklist dvb_usb_rtl28xxu' | \
+  sudo tee /etc/modprobe.d/blacklist-rtl28xxu.conf # survive reboots
+
+# build + run
+git clone https://github.com/jwfrancois/rtl-sdr-player.git
+cd rtl-sdr-player
+docker compose up -d --build
+```
+
+Then open `http://<server-ip>:8515` from any browser on your LAN.
+
+What compose sets up for you:
+
+* **USB passthrough** — `devices: ["/dev/bus/usb:/dev/bus/usb"]` makes the
+  dongle visible inside the container (no udev rules needed: the container
+  runs as root).
+* **One persistent volume** — everything that changes at runtime lives in
+  `/app/data` (the image sets `RTLSDR_DATA_DIR`): the 20 presets,
+  bookmarks, agent/LLM settings, the PI cache, digest texts and audit
+  reports. `docker compose down/up` keeps it; delete the `rtl-sdr-data`
+  volume to reset.
+* **Healthcheck** — the container self-reports based on `GET /api/status`.
+* **Sim fallback** — with no dongle passed through, the app serves the
+  simulated spectrum so you can still reach the UI.
+
+Prefer plain `docker run`?
+
+```bash
+docker build -t rtl-sdr-player .
+docker run -d --name rtl-sdr-player -p 8515:8515 --restart unless-stopped \
+  --device=/dev/bus/usb -v rtl-sdr-data:/app/data rtl-sdr-player
+```
+
+Notes: the digest's daily build hour follows the container's local time
+(`TZ` in docker-compose.yml); SMTP for the email digest is configured in
+the UI (AGENT panel → DIGEST). Manual Linux install (no Docker) still
+needs `librtlsdr-dev` per the section above — or just `libusb-1.0-0` when
+pyrtlsdrlib's bundled librtlsdr is used.
+
+---
+
+## What's new in v1.7.0
+
+**Scheduled-sweep change digest.** Every sweep, preset-bank change, PI
+lookup rename, AI naming round and RDS audit lands in a small journal.
+Once a day — at the hour you pick in the AGENT panel's DIGEST row — the
+receiver compiles the day's activity into a plain-text summary (sweeps
+run, presets added/removed/renamed with before→after names, AM noise
+floor, audit scores) and writes it to `<data>/state/digests/YYYY-MM-DD.txt`.
+Tick **email** and fill the SMTP settings to have the same text mailed to
+you (STARTTLS on port 587, SSL on 465, any standard provider or a local
+MTA; the password stays in `agent_config.json` on your machine). If the
+app was down at the scheduled hour, the missed day is built on the next
+start (catch-up). **Build now** compiles today's digest immediately;
+**Send now** builds + emails; the agent also answers `digest` and
+`send digest`.
+
+**Spectrum-wide RDS auditing.** The sweep tells you *what* is on air;
+the audit tells you *how well each station decodes*. Press **RDS audit**
+(SCANNER panel) and the receiver dwells 3–12 s (select) on every FM
+carrier from the last sweep plus the FM presets — up to 80 channels —
+recording: PI stability, PS completeness (partial names count), programme
+type, RadioText, stereo pilot, peak channel power, RDS group rate and an
+approximate block-error ratio. Those combine into a 0–100 quality score
+per station; the report shows the twelve weakest rows with a color-coded
+score badge and stays available across restarts (`state/audits/`, last
+10 kept, `GET /api/audit/report`). Tuning is restored afterwards, audio
+mutes during the pass, a manual tune stops it cleanly, and scheduled
+sweeps + audits cooperate through the same scan state machine.
+
+**Docker on an Ubuntu server.** A Dockerfile + docker-compose.yml turn
+the receiver into a headless LAN service (see *Setup (Ubuntu server /
+Docker)* above): Ubuntu 24.04 base, bundled librtlsdr via pyrtlsdrlib,
+USB passthrough, one persistent volume for all runtime state via the new
+`data_dir` / `RTLSDR_DATA_DIR` setting, and a healthcheck. The same
+`data_dir` config works outside Docker when you want state out of the
+app directory.
 
 ---
 

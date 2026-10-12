@@ -26,3 +26,6 @@ pi_cache_test.json
 Thumbs.db
 .idea/
 .vscode/
+
+# v1.7: digest journal + built digests + audit reports (runtime state)
+state/

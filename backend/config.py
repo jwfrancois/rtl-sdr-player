@@ -7,7 +7,7 @@ import json
 import os
 
 APP_NAME = "RTL-SDR Player"
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -36,6 +36,13 @@ DEFAULTS = {
     "stations_file": "stations.json",       # the 20 named station presets
     "sweep_results_file": "sweep_results.json",
     "agent_config_file": "agent_config.json",  # v1.5 agent/scheduler/LLM
+    # v1.7: RDS audit dwell per FM channel (spectrum-wide RDS quality audit)
+    "audit_dwell_s": 5.0,
+    # v1.7: relocate ALL runtime state (stations.json, agent_config.json,
+    # pi_cache.json, state/ digest+audit artifacts...) to one directory.
+    # Empty = next to app.py (Windows default). The Docker image sets the
+    # RTLSDR_DATA_DIR env var so a single volume persists everything.
+    "data_dir": "",
 }
 
 # Standard EIA CTCSS (PL) tones in Hz — the sub-audible squelch tones used
@@ -167,6 +174,11 @@ WX_NAMES = {
 # the 20 station presets fill up quickly even on a partial sweep.
 SWEEP_BAND_ORDER = ["wfm", "am", "wx", "air"]
 
+# v1.7 digest: journal retention (days) and where artifacts live relative
+# to the data root (data_root(config)).
+DIGEST_KEEP_DAYS = 8
+AUDIT_KEEP_COUNT = 10
+
 
 def load_config():
     cfg = dict(DEFAULTS)
@@ -179,7 +191,18 @@ def load_config():
                 cfg.update(user_cfg)
         except (OSError, ValueError):
             pass  # corrupt config file -> fall back to defaults
+    # container/server override: keep all runtime state in one volume
+    env_dir = os.environ.get("RTLSDR_DATA_DIR") or ""
+    if env_dir:
+        cfg["data_dir"] = env_dir
     return cfg
+
+
+def data_root(conf=None):
+    """Directory that holds every runtime artifact (config file names
+    resolve here). conf may be a loaded config; defaults to ROOT."""
+    base = (conf or {}).get("data_dir") if conf else None
+    return base or ROOT
 
 
 def clamp_to_band(freq_hz, band):

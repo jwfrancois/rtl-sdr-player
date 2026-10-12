@@ -1,0 +1,22 @@
+services:
+  rtl-sdr-player:
+    build: .
+    image: rtl-sdr-player:latest
+    container_name: rtl-sdr-player
+    ports:
+      - "8515:8515"
+    restart: unless-stopped
+    # Pass the USB bus through so the RTL-SDR dongle is visible.
+    # (Host tip: blacklist the DVB-TV driver so it does not claim the
+    # dongle:  echo 'blacklist dvb_usb_rtl28xxu' | \
+    #            sudo tee /etc/modprobe.d/blacklist-rtl28xxu.conf && reboot)
+    devices:
+      - "/dev/bus/usb:/dev/bus/usb"
+    volumes:
+      # presets, agent/LLM + mail settings, PI cache, digests, audits
+      - rtl-sdr-data:/app/data
+    environment:
+      - TZ=UTC            # set to your local zone: digest hours are local
+
+volumes:
+  rtl-sdr-data:

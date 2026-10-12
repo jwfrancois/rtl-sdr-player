@@ -374,6 +374,62 @@ async def api_tv_stream():
 
 
 # ----------------------------------------------------------------------
+# v1.7: spectrum-wide RDS audit + scheduled-sweep change digest
+# ----------------------------------------------------------------------
+@app.post("/api/audit/start")
+async def api_audit_start(body: dict):
+    """Dwell on every known FM carrier and score its RDS reception.
+    body: {freqs?: [hz...], dwell_s?: seconds} (default: last sweep's
+    stations + the FM presets)."""
+    try:
+        res = engine.start_audit(
+            freqs=body.get("freqs"),
+            dwell_s=(float(body["dwell_s"])
+                     if body.get("dwell_s") is not None else None))
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return {"ok": True, **res, "scan": engine.scan_status()}
+
+
+@app.post("/api/audit/stop")
+async def api_audit_stop():
+    stopped = engine.stop_audit()
+    return {"ok": True, "stopped": stopped, "audit": engine.audit_status()}
+
+
+@app.get("/api/audit/report")
+async def api_audit_report():
+    rep = engine.audit_report()
+    return {"ok": True, "report": rep, "audit": engine.audit_status()}
+
+
+@app.get("/api/digest")
+async def api_digest(day: str = None):
+    """The built digest for a day (default today); builds on the fly when
+    the journal has events but no digest was saved yet."""
+    try:
+        return engine.get_digest(day)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.post("/api/digest/build")
+async def api_digest_build(body: dict):
+    """Build the digest now. body: {day?: 'YYYY-MM-DD', send?: bool} —
+    send=true also emails it (SMTP settings live in the agent config)."""
+    try:
+        return engine.build_digest(body.get("day"), send=bool(body.get("send")))
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.get("/api/digest/days")
+async def api_digest_days():
+    return {"ok": True, "days": engine.digest_status()["days"],
+            "journal_days": engine._digest.days()}
+
+
+# ----------------------------------------------------------------------
 # WebSockets
 # ----------------------------------------------------------------------
 @app.websocket("/ws/audio")
@@ -444,10 +500,11 @@ async def ws_spectrum(ws: WebSocket):
             view = engine.get_view()
             if view:
                 sc = view.get("scan") or {}
-                if sc.get("running") and sc.get("mode") == "sweep":
-                    # During a sweep the UI only needs scan progress; the
-                    # full 4 KB PSD at 10 fps over a fast-retuning engine
-                    # can wedge the WS transport (v1.6), so sweeps send a
+                if sc.get("running") and sc.get("mode") in ("sweep",
+                                                             "audit"):
+                    # During a sweep/audit the UI only needs scan progress;
+                    # the full 4 KB PSD at 10 fps over a fast-retuning engine
+                    # can wedge the WS transport (v1.6), so they send a
                     # lightweight view at 1 fps. Live listening stays 10 fps.
                     now = time.monotonic()
                     if now - last_sweep_send >= 0.9:

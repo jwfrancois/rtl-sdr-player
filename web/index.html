@@ -141,6 +141,45 @@
             <input type="checkbox" id="ag-listen">while listening</label>
         </div>
         <div class="ag-status" id="ag-status">scheduled re-sweep off</div>
+        <div class="ag-digest">
+          <div class="ag-sched">
+            <span class="lbl">DIGEST</span>
+            <select id="dg-hour" title="Daily summary of scheduled-sweep preset changes, written to the log folder; optionally emailed">
+              <option value="">off</option>
+              <option value="6">06:00</option>
+              <option value="9" selected>09:00</option>
+              <option value="12">12:00</option>
+              <option value="18">18:00</option>
+              <option value="21">21:00</option>
+            </select>
+            <label class="ag-cb" title="Email the digest when it is built (SMTP settings below)">
+              <input type="checkbox" id="dg-email">email</label>
+            <button id="dg-build" class="btn btn-mini"
+                    title="Compile today's changes into the digest right now">Build now</button>
+            <button id="dg-send" class="btn btn-mini"
+                    title="Build the digest and email it immediately">Send now</button>
+          </div>
+          <div class="ag-status" id="dg-status">daily digest off</div>
+          <details class="ag-adv">
+            <summary>Last digest &amp; mail settings</summary>
+            <pre class="dg-text" id="dg-text">(no digest built yet)</pre>
+            <div class="ag-adv-grid">
+              <label>SMTP host
+                <input id="dg-host" placeholder="smtp.gmail.com" spellcheck="false" autocomplete="off"></label>
+              <label>Port
+                <input id="dg-port" type="number" value="587" min="1" max="65535"></label>
+              <label>User
+                <input id="dg-user" placeholder="you@gmail.com" spellcheck="false" autocomplete="off"></label>
+              <label>Password
+                <input id="dg-pass" type="password" placeholder="app password (stored locally only)" autocomplete="off"></label>
+              <label>From
+                <input id="dg-from" placeholder="you@gmail.com" spellcheck="false" autocomplete="off"></label>
+              <label>To
+                <input id="dg-to" placeholder="you@gmail.com" spellcheck="false" autocomplete="off"></label>
+              <button id="dg-save" class="btn btn-mini">Save mail settings</button>
+            </div>
+          </details>
+        </div>
         <details class="ag-adv">
           <summary>LLM settings (optional)</summary>
           <div class="ag-adv-grid">
@@ -232,6 +271,19 @@
         </div>
         <div class="am-floor" id="am-floor" hidden></div>
         <div class="sweep-results" id="sweep-results"></div>
+        <div class="scan-row sweep-row">
+          <span class="lbl">AUDIT</span>
+          <select id="audit-dwell" title="Time spent per FM channel decoding RDS during the audit">
+            <option value="3">3 s</option>
+            <option value="5" selected>5 s</option>
+            <option value="8">8 s</option>
+            <option value="12">12 s</option>
+          </select>
+          <button id="audit-btn" class="btn btn-mini btn-accent"
+                  title="RDS audit: dwell on every FM station found by the sweep and score its reception (PI stability, PS completeness, programme type, block errors)">RDS audit</button>
+        </div>
+        <div class="audit-summary" id="audit-summary" hidden></div>
+        <div class="audit-results" id="audit-results"></div>
         <div class="scan-row sq-row">
           <span class="lbl">SQL</span>
           <input type="range" id="squelch" min="-60" max="-5" value="-30" step="1">

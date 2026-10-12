@@ -36,6 +36,17 @@ AGENT_DEFAULTS = {
     "am_sensitivity": "medium",    # low | medium | high (noise-floor margin)
     "pi_lookup_enabled": True,     # resolve PI codes via online databases
     "pi_lookup_url": "",           # optional custom URL template with {pi}
+    # v1.7: RDS audit + scheduled-sweep change digest
+    "audit_dwell_s": 5.0,          # seconds per FM channel in the audit
+    "digest_enabled": False,       # build a daily digest of sweep changes
+    "digest_hour": 9,              # local hour of the daily build
+    "digest_email_enabled": False, # email the digest when it is built
+    "digest_smtp_host": "",        # e.g. smtp.gmail.com
+    "digest_smtp_port": 587,       # 587 STARTTLS / 465 SSL
+    "digest_smtp_user": "",
+    "digest_smtp_pass": "",        # stays on this machine
+    "digest_email_from": "",
+    "digest_email_to": "",
 }
 
 
@@ -307,8 +318,10 @@ def dial_report(engine, acfg):
 HELP = (
     "I can: tune 101.7 | am 1010 | 121.5 | 162.550 · "
     "scan fm / am / noaa / airband · sweep all (or: sweep fm wx) · "
+    "audit rds (quality report of every FM station) · "
     "stop scan · next / previous station · report (what's on?) · "
     "lookup pi 2A5B (online callsign lookup) · "
+    "digest (today's sweep changes) · send digest (build + email) · "
     "name the stations (AI) · sweep every 30 minutes / sweeps off · "
     "status. With an LLM configured I also understand fuzzier requests."
 )
@@ -430,6 +443,22 @@ def _dispatch(action, args, engine, acfg):
                 f'{res.get("error") or "no match (offline)"}')
     if action == "schedule":
         return _apply_schedule(engine, args.get("minutes", 0), acfg)
+    if action == "audit":
+        res = engine.start_audit(dwell_s=args.get("dwell_s"))
+        return (f"RDS audit started: {res['channels']} FM station(s), "
+                f"{res['dwell_s']:g} s each (~{res['seconds_est']} s total). "
+                "Audio mutes until done — the report lands in the "
+                "AUDIT panel.")
+    if action == "digest":
+        if args.get("send"):
+            res = engine.build_digest(send=True)
+            if res.get("emailed"):
+                return f"Digest for {res['day']} built and emailed."
+            return (f"Digest for {res['day']} built, but the email did not "
+                    f"go out: {res.get('email_note') or 'email disabled'}. "
+                    "It is available in the AGENT panel.")
+        res = engine.get_digest(args.get("day"))
+        return (f"DIGEST {res['day']}\n{res['text']}")
     if action == "status":
         st = engine.status()
         f = st["freq_hz"]
@@ -523,6 +552,16 @@ def _execute_command(engine, text, acfg):
     if re.search(r"\b(ai|llm|smart)\b.*\bname|\bname\b.*\b(stations?|presets?|slots?)\b|\benrich\b|\bai\s*names?", low):
         return done("enrich", _dispatch("enrich", {}, engine, acfg))
 
+    # RDS audit (before "report" so "audit the fm band" does not fall through)
+    if re.search(r"\baudit\b", low):
+        return done("audit", _dispatch("audit", {}, engine, acfg))
+
+    # digest: "digest", "today's digest", "send/email the digest"
+    if re.search(r"\bdigest\b|\bsummary mail\b", low):
+        send = bool(re.search(r"\b(send|email|mail)\b", low))
+        return done("digest", _dispatch("digest", {"send": send},
+                                        engine, acfg))
+
     # report
     if re.search(r"\breport\b|what.?s on|what.?s playing|hear|summar(y|ize)|dial report", low):
         return done("report", _dispatch("report", {}, engine, acfg))
@@ -562,6 +601,8 @@ def _execute_command(engine, text, acfg):
                              '{"action":"report","args":{}} | '
                              '{"action":"enrich","args":{}} | '
                              '{"action":"lookup","args":{"pi":"4 hex digits"}} | '
+                             '{"action":"audit","args":{}} | '
+                             '{"action":"digest","args":{"send":boolean}} | '
                              '{"action":"schedule","args":{"minutes":number (0=off)}} | '
                              '{"action":"status","args":{}} | '
                              "Pick the single closest action. JSON only."},
@@ -580,6 +621,10 @@ def _execute_command(engine, text, acfg):
                 if not re.fullmatch(r"[0-9A-Fa-f]{4}",
                                     str(args.get("pi") or "")):
                     raise AgentError("no 4-digit hex pi")
+            if action not in ("tune", "scan", "sweep", "stop", "next",
+                              "prev", "report", "enrich", "lookup", "audit",
+                              "digest", "schedule", "status"):
+                raise AgentError(f"unknown action {action}")
             reply = _dispatch(action, args, engine, acfg)
             if reply is not None:
                 return done(action + " (ai)", reply)

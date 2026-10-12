@@ -419,6 +419,10 @@ class RdsDecoder:
         return {
             "pi": f"{self._pi:04X}" if self._pi is not None else None,
             "ps": ps,
+            # v1.7: partial PS + segment bookkeeping (RDS audit quality
+            # metric: how much of the 8-character name has arrived)
+            "ps_partial": "".join(self._ps).rstrip() or None,
+            "ps_missing": len(self._ps_missing),
             "pty": PTY_NAMES_RBDS[self._pty] if self._pty is not None else None,
             "tp": self._tp,
             "ta": self._ta,
