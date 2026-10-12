@@ -72,6 +72,8 @@
         <div class="mem-head">
           <span class="lbl">STATIONS (20)</span>
           <span class="st-actions">
+            <button id="st-notify" class="btn btn-mini"
+                    title="Desktop notifications when the preset bank changes (scheduled re-sweep auto-fill, online PI lookup renames, AI naming)">Notify</button>
             <button id="st-fill" class="btn btn-mini"
                     title="Fill all 20 slots from the last band sweep (strongest first)">Fill from sweep</button>
             <button id="st-clear" class="btn btn-mini" title="Empty all 20 slots">Clear</button>
@@ -79,6 +81,21 @@
         </div>
         <div class="st-grid" id="st-grid"></div>
         <div class="st-hint">click: tune &middot; right-click: save current &middot; double-click: rename</div>
+      </div>
+
+      <div class="studio" id="studio-panel">
+        <div class="mem-head">
+          <span class="lbl">SOUND STUDIO</span>
+          <span class="st-actions">
+            <button id="ss-auto" class="btn btn-mini btn-accent"
+                    title="Pick the studio preset automatically from the station type (band + RDS programme type)">AUTO</button>
+          </span>
+        </div>
+        <div class="ss-type" id="ss-type">listening&hellip;</div>
+        <div class="ss-chips" id="ss-chips"></div>
+        <div class="ss-eq" id="ss-eq"></div>
+        <div class="ss-vu" title="Output level (post-EQ, post-compressor)"><div class="ss-vu-fill" id="ss-vu-fill"></div><div class="ss-vu-peak" id="ss-vu-peak"></div></div>
+        <div class="st-hint">EQ trims are saved per preset</div>
       </div>
 
       <div class="bookmarks" id="bookmarks-panel">
@@ -204,10 +221,16 @@
             <label><input type="checkbox" class="sweep-band" value="wx" checked>WX</label>
             <label><input type="checkbox" class="sweep-band" value="air" checked>AIR</label>
           </span>
+          <select id="am-sens" title="AM sweep sensitivity: how far above the measured AM noise floor a carrier must rise to count as a station">
+            <option value="low">AM low</option>
+            <option value="medium" selected>AM med</option>
+            <option value="high">AM high</option>
+          </select>
           <button id="sweep-btn" class="btn btn-mini btn-accent"
                   title="Sweep every channel of the checked bands, measure power, decode RDS names — then use Fill from sweep">
             All bands</button>
         </div>
+        <div class="am-floor" id="am-floor" hidden></div>
         <div class="sweep-results" id="sweep-results"></div>
         <div class="scan-row sq-row">
           <span class="lbl">SQL</span>
@@ -272,6 +295,8 @@
   <span class="stat"><span class="stat-k">BUFFER</span> <span id="stat-buffer">&mdash;</span></span>
   <span class="stat stat-right" id="stat-note"></span>
 </footer>
+
+<div id="toasts"></div>
 
 <script src="app.js"></script>
 </body>

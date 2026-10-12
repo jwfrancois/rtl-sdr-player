@@ -18,6 +18,8 @@ stations_test.json
 sweep_results.json
 sweep_results_test.json
 agent_config.json
+pi_cache.json
+pi_cache_test.json
 
 # OS / editor
 .DS_Store

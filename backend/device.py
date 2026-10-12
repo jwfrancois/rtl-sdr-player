@@ -261,45 +261,64 @@ class SimDevice:
         t = t0 + np.arange(n, dtype=np.float64) / fs
         self._t = t0 + n / fs
 
-        is_am_band = self.direct_sampling in ("q", "i", 1, 2)
         two_pi = 2.0 * math.pi
 
         out = (self._rng.standard_normal(n)
                + 1j * self._rng.standard_normal(n)).astype(np.complex64) * 0.035
 
+        # Slow modulation tones (audio <= ~600 Hz, LFO 0.13 Hz) are
+        # computed on a coarse time grid and linearly interpolated to the
+        # capture rate: synthesizing them at 2.4 MHz wastes ~50x of the
+        # per-block numpy budget and pushed AM blocks past realtime.
+        step = 64
+        tc = t[::step]
+        nc = len(tc)
+        fine = np.arange(n, dtype=np.float64) / step
+        coarse_x = np.arange(nc, dtype=np.float64)
+
         for freq, amp, kind in self.STATIONS:
             off = freq - self.center
-            if is_am_band:
-                if kind not in ("am", "ssb", "ssbl"):
-                    continue
-                # direct sampling: the tuned station lands at DC naturally
-            elif abs(off) > fs * 0.47:
-                continue  # station outside the captured window
+            if abs(off) > fs * 0.47:
+                continue  # station outside the captured window (all modes;
+            # direct sampling included: synthesizing every AM/SSB station
+            # regardless of distance made AM blocks ~2.6x slower than
+            # realtime once the huge sin/exp arguments hit Payne-Hanek
+            # reduction, starving the whole pipeline)
 
             # Three-tone modulation unique per station
             k = int(abs(freq) / 1e6)
-            m1 = two_pi * (220.0 + 40.0 * k) * t
-            m2 = two_pi * (331.0 + 17.0 * k) * t + 1.1
-            m3 = two_pi * (523.0 + 11.0 * k) * t + 2.3
-            audio = (np.sin(m1) + 0.5 * np.sin(m2) + 0.25 * np.sin(m3)) / 1.75
-            lfo = 0.75 + 0.25 * np.sin(two_pi * 0.13 * t + k)
+            m1 = two_pi * (220.0 + 40.0 * k) * tc
+            m2 = two_pi * (331.0 + 17.0 * k) * tc + 1.1
+            m3 = two_pi * (523.0 + 11.0 * k) * tc + 2.3
+            audio = np.interp(
+                fine, coarse_x,
+                (np.sin(m1) + 0.5 * np.sin(m2) + 0.25 * np.sin(m3)) / 1.75)
+            lfo = np.interp(fine, coarse_x,
+                            0.75 + 0.25 * np.sin(two_pi * 0.13 * tc + k))
 
             if kind == "am":
-                # AM voice: carrier + modulated sidebands
+                # AM voice: carrier + modulated sidebands. The carrier phase
+                # argument is kept inside one turn: the envelope (all the AM
+                # detector needs) is unaffected, but numpy's sin/cos stay on
+                # the fast path instead of huge-argument reduction.
+                ph = (two_pi * off * t) % two_pi
                 sig = (1.0 + 0.5 * audio * lfo) * np.exp(
-                    1j * (two_pi * off * t)).astype(np.complex64)
+                    1j * ph).astype(np.complex64)
             elif kind in ("ssb", "ssbl"):
                 # Single sideband, carrier suppressed. The complex envelope
                 # of a USB voice is the ANALYTIC signal (positive-frequency
                 # tones only); LSB is its conjugate. Voice tones stay inside
                 # the 300-3000 Hz SSB passband on purpose.
-                va = (np.exp(1j * two_pi * 440.0 * t)
-                      + 0.5 * np.exp(1j * (two_pi * 880.0 * t + 1.1))
-                      + 0.25 * np.exp(1j * (two_pi * 1320.0 * t + 2.3))
-                      ) / 1.75 * lfo
+                mva1 = np.exp(1j * two_pi * 440.0 * tc)
+                mva2 = np.exp(1j * (two_pi * 880.0 * tc + 1.1))
+                mva3 = np.exp(1j * (two_pi * 1320.0 * tc + 2.3))
+                va_c = (mva1 + 0.5 * mva2 + 0.25 * mva3) / 1.75 * lfo[::step]
+                va = (np.interp(fine, coarse_x, va_c.real)
+                      + 1j * np.interp(fine, coarse_x, va_c.imag))
                 if kind == "ssbl":
                     va = np.conj(va)
-                sig = (va * np.exp(1j * two_pi * off * t)).astype(np.complex64)
+                ph = (two_pi * off * t) % two_pi
+                sig = (va * np.exp(1j * ph)).astype(np.complex64)
             elif kind == "nbfm":
                 # +/-5 kHz deviation, integrated properly for the NBFM scale,
                 # plus the station's CTCSS tone at 350 Hz deviation

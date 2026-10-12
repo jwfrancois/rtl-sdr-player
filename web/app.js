@@ -32,6 +32,13 @@ const S = {
   sweepResults: [],         // last all-band sweep (strongest first)
   sweepFetchT: 0,           // throttle for results polling while sweeping
   agentTouched: 0,          // ts: don't fight the user editing agent UI
+  // v1.6: sound studio (EQ + compressor chain, auto preset by station type)
+  studio: { auto: true, preset: "music", input: null, filters: [],
+            comp: null, analyser: null, vuBuf: null, vuPeak: 0, raf: 0,
+            trim: {}, lastKey: null, detected: null },
+  // v1.6: preset-bank change feed -> desktop notifications / toasts
+  notify: { enabled: false, lastRev: null },
+  selfCommit: 0,            // own edits pending echo in stations_rev
 };
 
 const $ = (id) => document.getElementById(id);
@@ -45,11 +52,61 @@ const STEP = { wfm: 100e3, am: 10e3, wx: 25e3, air: 25e3 };
 const BAND_DEFAULT = { wfm: 98.3e6, am: 990e3, wx: 162.55e6, air: 121.5e6 };
 const fmtFreq = (hz) => (hz / FMT[S.band].div).toFixed(FMT[S.band].dec);
 
+// ---------------------------------------------------------------- studio
+// v1.6: 5-band EQ + compressor between the PCM player and the speakers.
+// The preset is chosen automatically from the station type (band + RDS
+// programme type) so speech gets intelligibility, music gets a smiley
+// curve, weather/airband get comms clarity, and AM gets its warmth.
+const STUDIO_BANDS = [
+  { key: "bass",     label: "BASS",     f: 90,   type: "lowshelf" },
+  { key: "lowmid",   label: "LOW MID",  f: 250,  type: "peaking", q: 1.0 },
+  { key: "mid",      label: "MID",      f: 1000, type: "peaking", q: 1.0 },
+  { key: "presence", label: "PRESENCE", f: 3500, type: "peaking", q: 1.0 },
+  { key: "treble",   label: "TREBLE",   f: 9000, type: "highshelf" },
+];
+const STUDIO_PRESETS = {
+  studio: { label: "Studio",  eq: [0, 0, 0, 0, 0],           comp: null },
+  music:  { label: "Music",   eq: [2.5, 0.5, -1, -0.5, 2],   comp: { thr: -24, ratio: 2, att: 0.01,  rel: 0.25 } },
+  speech: { label: "Speech",  eq: [-5, -1.5, 2.5, 3.5, 1.5], comp: { thr: -28, ratio: 3, att: 0.005, rel: 0.2 } },
+  am:     { label: "AM Warm", eq: [-7, -2, 2.5, 2.5, -4],    comp: { thr: -30, ratio: 4, att: 0.004, rel: 0.18 } },
+  noaa:   { label: "NOAA",    eq: [-4, 0, 2, 4, 1.5],        comp: { thr: -32, ratio: 5, att: 0.003, rel: 0.15 } },
+  air:    { label: "Airband", eq: [-14, -5, 3.5, 5, -3],     comp: { thr: -34, ratio: 6, att: 0.002, rel: 0.12 } },
+  night:  { label: "Night",   eq: [-2.5, 0, 0, 1, 2.5],      comp: { thr: -26, ratio: 4, att: 0.006, rel: 0.3 } },
+};
+// RBDS programme types that read as spoken word -> Speech preset
+const TALK_PTYS = new Set(["News", "Information", "Sports", "Talk",
+  "Weather", "Emergency Test", "Emergency", "Public", "Religious Talk",
+  "Personality", "Spanish Talk"]);
+
+function stationType(band, mode, pty) {
+  if (band === "wx") return { preset: "noaa", type: "Weather radio" };
+  if (band === "air") return { preset: "air", type: "Airband comms" };
+  if (band === "am") {
+    if (mode === "usb" || mode === "lsb")
+      return { preset: "speech", type: "SSB voice" };
+    return { preset: "am", type: "AM broadcast" };
+  }
+  if (band === "wfm") {
+    if (pty && TALK_PTYS.has(pty)) return { preset: "speech", type: pty };
+    if (pty) return { preset: "music", type: pty };
+    return { preset: "music", type: "FM music" };
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- boot
 window.addEventListener("DOMContentLoaded", boot);
 
 async function boot() {
+  // restore studio + notification prefs (localStorage)
+  S.studio.auto = localStorage.getItem("studioAuto") !== "0";
+  S.studio.preset = localStorage.getItem("studioPreset") || "music";
+  if (!STUDIO_PRESETS[S.studio.preset]) S.studio.preset = "music";
+  try { S.studio.trim = JSON.parse(localStorage.getItem("studioTrim") || "{}"); }
+  catch { S.studio.trim = {}; }
+  S.notify.enabled = localStorage.getItem("notifyPresets") === "1";
   wireControls();
+  buildStudioUI();
   updateReadout(S.freq);
   connectSockets();          // spectrum/status must not depend on audio
   initAudio().catch((e) => console.warn("audio init deferred:", e));
@@ -198,6 +255,19 @@ function applyStatus(st) {
     S.stationsJson = stJson;
     S.stations = st.stations || [];
     renderStations();
+  }
+
+  // v1.6: preset-bank change feed -> desktop notification / toast.
+  // Own edits (save/rename/fill from this tab) are counted and swallowed
+  // so the user is not notified about their own actions.
+  if (typeof st.stations_rev === "number") {
+    if (S.notify.lastRev === null) {
+      S.notify.lastRev = st.stations_rev;   // baseline: never notify on load
+    } else if (st.stations_rev !== S.notify.lastRev) {
+      S.notify.lastRev = st.stations_rev;
+      if (S.selfCommit > 0) S.selfCommit -= 1;
+      else if (st.stations_change) presetChangeNotice(st.stations_change);
+    }
   }
 
   // v1.5: agent scheduler + LLM state
@@ -353,6 +423,7 @@ function wireControls() {
         body: JSON.stringify({}),
       })).json();
       if (d.ok) {
+        S.selfCommit += 1;
         S.stations = d.stations;
         S.stationsJson = JSON.stringify(d.stations);
         renderStations();
@@ -366,6 +437,7 @@ function wireControls() {
     try {
       const d = await (await fetch("/api/stations/clear", { method: "POST" })).json();
       if (d.ok) {
+        S.selfCommit += 1;
         S.stations = [];
         S.stationsJson = JSON.stringify(d.stations || []);
         renderStations();
@@ -392,6 +464,32 @@ function wireControls() {
     }).then((r) => r.json()).then((d) => {
       if (!d.ok) $("stat-note").textContent = "\u26a0 " + (d.error || "sweep failed");
     }).catch(() => {});
+  };
+
+  // ---- v1.6: AM sweep sensitivity (persisted in agent config) ----
+  $("am-sens").addEventListener("change", (e) => {
+    agentConfigSave({ am_sensitivity: e.target.value });
+  });
+
+  // ---- v1.6: preset-bank desktop notifications ----
+  $("st-notify").textContent = S.notify.enabled ? "Notify on" : "Notify";
+  $("st-notify").onclick = async () => {
+    if (S.notify.enabled) {
+      S.notify.enabled = false;
+      localStorage.setItem("notifyPresets", "0");
+      $("st-notify").textContent = "Notify";
+      toast("Preset notifications off");
+      return;
+    }
+    const ok = await requestNotifyPermission();
+    S.notify.enabled = ok;
+    localStorage.setItem("notifyPresets", ok ? "1" : "0");
+    $("st-notify").textContent = ok ? "Notify on" : "Notify";
+    if (ok) {
+      toast("Preset notifications on",
+        "You will get a ping when re-sweeps / auto-fill / PI lookup "
+        + "change the 20 presets.");
+    }
   };
 
   // ---- bookmarks ----
@@ -482,6 +580,10 @@ function applyAgentStatus(ag, force) {
   $("ag-autofill").checked = !!ag.schedule.auto_fill;
   $("ag-listen").checked = !!ag.schedule.allow_listeners;
   $("ag-llm-on").checked = !!ag.llm.enabled;
+  if (ag.am_sensitivity &&
+      document.activeElement !== $("am-sens")) {
+    $("am-sens").value = ag.am_sensitivity;
+  }
   if (ag.llm.base_url && !$("ag-llm-url").value) {
     $("ag-llm-url").value = ag.llm.base_url;
   }
@@ -731,7 +833,269 @@ async function initAudio() {
   };
   S.node.port.postMessage({ type: "cfg", targetMs: S.targetMs, ratio });
   S.node.port.postMessage({ type: "vol", v: S.volume });
-  S.node.connect(S.actx.destination);
+  buildStudioChain();
+  S.node.connect(S.studio.input);
+}
+
+// ------------------------------------------------------- studio (v1.6)
+// worklet -> input -> 5-band EQ -> compressor -> analyser -> master -> out
+function buildStudioChain() {
+  const actx = S.actx;
+  const input = actx.createGain();
+  const filters = STUDIO_BANDS.map((b) => {
+    const f = actx.createBiquadFilter();
+    f.type = b.type;
+    f.frequency.value = b.f;
+    if (b.q) f.Q.value = b.q;
+    f.gain.value = 0;
+    return f;
+  });
+  const comp = actx.createDynamicsCompressor();
+  comp.knee.value = 12;
+  comp.threshold.value = -20;
+  comp.ratio.value = 3;
+  comp.attack.value = 0.006;
+  comp.release.value = 0.25;
+  const analyser = actx.createAnalyser();
+  analyser.fftSize = 512;
+  const master = actx.createGain();
+  master.gain.value = 1.0;
+  let prev = input;
+  for (const f of filters) { prev.connect(f); prev = f; }
+  prev.connect(comp);
+  comp.connect(analyser);
+  analyser.connect(master);
+  master.connect(actx.destination);
+  S.studio.input = input;
+  S.studio.filters = filters;
+  S.studio.comp = comp;
+  S.studio.analyser = analyser;
+  S.studio.vuBuf = new Float32Array(analyser.fftSize);
+  applyStudioPreset(S.studio.preset, true);
+  startVU();
+}
+
+function applyStudioPreset(name, silent) {
+  const def = STUDIO_PRESETS[name] || STUDIO_PRESETS.music;
+  S.studio.preset = name;
+  localStorage.setItem("studioPreset", name);
+  if (S.studio.filters.length) {
+    const t = S.actx.currentTime;
+    const trim = S.studio.trim[name] || [0, 0, 0, 0, 0];
+    STUDIO_BANDS.forEach((b, i) => {
+      S.studio.filters[i].gain.setTargetAtTime(
+        def.eq[i] + (trim[i] || 0), t, 0.08);
+    });
+    const c = def.comp;
+    const cp = S.studio.comp;
+    if (c) {
+      cp.threshold.setTargetAtTime(c.thr, t, 0.1);
+      cp.ratio.setTargetAtTime(c.ratio, t, 0.1);
+      cp.attack.setTargetAtTime(c.att, t, 0.1);
+      cp.release.setTargetAtTime(c.rel, t, 0.1);
+    } else {
+      cp.threshold.setTargetAtTime(0, t, 0.1);
+      cp.ratio.setTargetAtTime(1, t, 0.1);
+    }
+  }
+  if (!silent) renderStudio();
+}
+
+function renderStudio() {
+  const def = STUDIO_PRESETS[S.studio.preset] || STUDIO_PRESETS.music;
+  document.querySelectorAll("#ss-chips .ss-chip").forEach((c) =>
+    c.classList.toggle("active", c.dataset.preset === S.studio.preset));
+  const autoBtn = $("ss-auto");
+  autoBtn.classList.toggle("btn-accent", S.studio.auto);
+  const det = S.studio.detected;
+  const typeTxt = det ? det.type : "listening\u2026";
+  $("ss-type").innerHTML =
+    (S.studio.auto ? "<b>AUTO</b> \u00b7 " : "MANUAL \u00b7 ")
+    + escapeHtml(typeTxt) + " \u00b7 " + escapeHtml(def.label);
+  // sliders show preset curve + personal trim (skip the one being dragged)
+  const trim = S.studio.trim[S.studio.preset] || [0, 0, 0, 0, 0];
+  document.querySelectorAll("#ss-eq input[type=range]").forEach((inp, i) => {
+    if (document.activeElement === inp) return;
+    inp.value = def.eq[i] + (trim[i] || 0);
+    const val = inp.parentElement.querySelector(".ss-val");
+    if (val) val.textContent = (inp.value > 0 ? "+" : "")
+      + parseFloat(inp.value).toFixed(1) + " dB";
+  });
+}
+
+function buildStudioUI() {
+  const chips = $("ss-chips");
+  chips.innerHTML = "";
+  for (const [key, def] of Object.entries(STUDIO_PRESETS)) {
+    const b = document.createElement("button");
+    b.className = "ss-chip";
+    b.dataset.preset = key;
+    b.textContent = def.label;
+    b.title = "Studio preset: " + def.label;
+    b.onclick = () => {
+      S.studio.auto = false;
+      localStorage.setItem("studioAuto", "0");
+      applyStudioPreset(key);
+    };
+    chips.appendChild(b);
+  }
+  const eq = $("ss-eq");
+  eq.innerHTML = "";
+  STUDIO_BANDS.forEach((b, i) => {
+    const row = document.createElement("label");
+    row.className = "ss-band";
+    const lbl = document.createElement("span");
+    lbl.className = "ss-lbl";
+    lbl.textContent = b.label;
+    const inp = document.createElement("input");
+    inp.type = "range";
+    inp.min = -15; inp.max = 15; inp.step = 0.5; inp.value = 0;
+    inp.dataset.band = i;
+    inp.title = b.label + " trim (saved per preset)";
+    const val = document.createElement("span");
+    val.className = "ss-val";
+    val.textContent = "0.0 dB";
+    inp.addEventListener("input", () => {
+      if (S.studio.auto) {
+        S.studio.auto = false;
+        localStorage.setItem("studioAuto", "0");
+      }
+      const trim = S.studio.trim[S.studio.preset]
+        || (S.studio.trim[S.studio.preset] = [0, 0, 0, 0, 0]);
+      trim[i] = parseFloat(inp.value);
+      localStorage.setItem("studioTrim", JSON.stringify(S.studio.trim));
+      applyStudioPreset(S.studio.preset);
+    });
+    row.appendChild(lbl); row.appendChild(inp); row.appendChild(val);
+    eq.appendChild(row);
+  });
+  $("ss-auto").onclick = () => {
+    S.studio.auto = !S.studio.auto;
+    localStorage.setItem("studioAuto", S.studio.auto ? "1" : "0");
+    if (S.studio.auto) {
+      S.studio.lastKey = null;   // re-evaluate right now
+      const det = stationType(S.band, S.mode, S.lastPty || null);
+      S.studio.detected = det;
+      if (det && det.preset !== S.studio.preset) applyStudioPreset(det.preset);
+      else applyStudioPreset(S.studio.preset);
+    } else {
+      applyStudioPreset(S.studio.preset);
+    }
+  };
+  renderStudio();
+}
+
+// called on every spectrum frame + after tunes; picks the studio preset
+// from the station type when AUTO is on
+function studioAutoCheck(band, mode, pty) {
+  S.lastPty = pty || null;
+  const key = band + "|" + (mode || "") + "|" + (pty || "");
+  if (key === S.studio.lastKey) return;
+  S.studio.lastKey = key;
+  const det = stationType(band, mode, pty);
+  S.studio.detected = det;
+  if (S.studio.auto && det && det.preset !== S.studio.preset) {
+    applyStudioPreset(det.preset);
+  } else {
+    renderStudio();
+  }
+}
+
+function startVU() {
+  if (S.studio.raf) return;
+  const loop = () => {
+    S.studio.raf = requestAnimationFrame(loop);
+    const an = S.studio.analyser;
+    if (!an || !S.studio.vuBuf) return;
+    an.getFloatTimeDomainData(S.studio.vuBuf);
+    let sum = 0;
+    for (let i = 0; i < S.studio.vuBuf.length; i++) {
+      sum += S.studio.vuBuf[i] * S.studio.vuBuf[i];
+    }
+    const rms = Math.sqrt(sum / S.studio.vuBuf.length);
+    const db = 20 * Math.log10(rms + 1e-9);
+    const pct = Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
+    $("ss-vu-fill").style.width = pct.toFixed(1) + "%";
+    S.studio.vuPeak = Math.max(pct, S.studio.vuPeak - 0.6);
+    $("ss-vu-peak").style.left = S.studio.vuPeak.toFixed(1) + "%";
+  };
+  loop();
+}
+
+// --------------------------------------------- notifications (v1.6)
+async function requestNotifyPermission() {
+  if (!("Notification" in window)) {
+    toast("Desktop notifications unsupported",
+      "In-page toasts will be used instead.");
+    return false;
+  }
+  if (Notification.permission === "granted") return true;
+  if (Notification.permission === "denied") {
+    toast("Notifications are blocked",
+      "Allow notifications for this site in the browser's site settings.");
+    return false;
+  }
+  try {
+    return (await Notification.requestPermission()) === "granted";
+  } catch {
+    return false;
+  }
+}
+
+const NOTIFY_SOURCE = {
+  "auto-fill": "scheduled re-sweep auto-fill",
+  fill: "fill from sweep",
+  "PI lookup": "online PI callsign lookup",
+  "AI naming": "AI naming",
+  clear: "presets cleared",
+  save: "manual save",
+  rename: "rename",
+  delete: "preset deleted",
+};
+
+function presetChangeNotice(ch) {
+  const parts = [];
+  if (ch.added && ch.added.length) parts.push(ch.added.length + " added");
+  if (ch.renamed && ch.renamed.length) parts.push(ch.renamed.length + " renamed");
+  if (ch.removed && ch.removed.length) parts.push(ch.removed.length + " removed");
+  if (!parts.length) return;   // cosmetic-only change
+  const src = NOTIFY_SOURCE[ch.source] || ch.source || "scan";
+  const names = (ch.added || []).slice(0, 3).map((s) => s.name).join(", ");
+  const title = "Preset bank updated \u2014 " + parts.join(", ");
+  const body = (names ? names
+    + ((ch.added || []).length > 3 ? "\u2026" : "") + " \u00b7 " : "") + src;
+  if (S.notify.enabled && "Notification" in window
+      && Notification.permission === "granted") {
+    try {
+      const n = new Notification("RTL-SDR Player \u2014 " + title,
+        { body, tag: "stations" });
+      n.onclick = () => window.focus();
+    } catch { /* stale permission or SW issue: toast already covers it */ }
+  }
+  toast(title, body);
+}
+
+function toast(title, sub) {
+  const wrap = $("toasts");
+  if (!wrap) return;
+  const el = document.createElement("div");
+  el.className = "toast";
+  const b = document.createElement("b");
+  b.textContent = title;
+  el.appendChild(b);
+  if (sub) {
+    const s = document.createElement("div");
+    s.className = "t-sub";
+    s.textContent = sub;
+    el.appendChild(s);
+  }
+  wrap.appendChild(el);
+  while (wrap.children.length > 4) wrap.removeChild(wrap.firstChild);
+  setTimeout(() => {
+    el.style.transition = "opacity .3s";
+    el.style.opacity = "0";
+    setTimeout(() => el.remove(), 320);
+  }, 7000);
 }
 
 function flushAudio() {
@@ -782,14 +1146,20 @@ function connectSpectrum(proto) {
   ws.onmessage = (msg) => {
     const ev = JSON.parse(msg.data);
     if (ev.event === "psd") {
-      S.psd = ev;
-      drawSpectrum();
-      drawWaterfall();
-      drawAxis(ev);
+      // During sweeps the server sends lightweight frames without a PSD
+      // array (scan progress only): keep the last spectrum on screen.
+      if (ev.psd_db) {
+        S.psd = ev;
+        drawSpectrum();
+        drawWaterfall();
+        drawAxis(ev);
+      }
       updateMeter(ev);
       updateRds(ev);
       updateScan(ev);
       updateSql(ev);
+      studioAutoCheck(ev.band, ev.demod_mode,
+        (ev.rds && ev.rds.pty) || null);
       if (ev.band === S.band && Math.abs(ev.freq_hz - S.freq) > 500) {
         updateReadout(ev.freq_hz);   // server-driven change (e.g. scanner)
       }
@@ -909,6 +1279,24 @@ function updateScan(ev) {
   }
   $("scan-btn").textContent = (sc.running && sc.mode !== "sweep") ? "Stop" : "Scan";
   $("sweep-btn").textContent = (sc.running && sc.mode === "sweep") ? "Stop" : "All bands";
+
+  // v1.6: AM adaptive-sensitivity readout
+  const af = $("am-floor");
+  if (sc.probing) {
+    af.hidden = false;
+    af.className = "am-floor probe";
+    af.textContent = "AM noise-floor probe "
+      + ((sc.probe_i || 0) + 1) + "/" + (sc.probe_count || "?")
+      + " \u00b7 " + (sc.am_sens || "medium") + " sensitivity";
+  } else if (sc.am_floor_db != null && sc.am_thr_db != null) {
+    af.hidden = false;
+    af.className = "am-floor";
+    af.textContent = "AM floor " + sc.am_floor_db.toFixed(0)
+      + " dB \u00b7 threshold " + sc.am_thr_db.toFixed(0)
+      + " dB \u00b7 " + (sc.am_sens || "medium") + " sensitivity";
+  } else {
+    af.hidden = true;
+  }
 
   // while a sweep runs (and once right after it finishes), pull results
   if (sc.mode === "sweep") {
@@ -1077,6 +1465,7 @@ async function saveStationToSlot(slot) {
                              mode: S.mode }),
     })).json();
     if (d.ok) {
+      S.selfCommit += 1;
       S.stations = d.stations;
       S.stationsJson = JSON.stringify(d.stations);
       renderStations();
@@ -1098,6 +1487,7 @@ async function renameStation(slot) {
       body: JSON.stringify({ slot, name: name.trim() }),
     })).json();
     if (d.ok) {
+      S.selfCommit += 1;
       S.stations = d.stations;
       S.stationsJson = JSON.stringify(d.stations);
       renderStations();

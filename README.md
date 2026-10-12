@@ -17,6 +17,8 @@ Dongle → [this app] → http://localhost:8515
              ├── Live spectrum + waterfall with click-to-tune
              ├── Agent (v1.5)            scheduled background re-sweeps, natural-language
              │                           control, LLM station naming, dial report
+             ├── Sound Studio (v1.6)     5-band EQ + compressor, presets auto-switched
+             │                           by station type, output VU meter
              └── TV tab                  DVB-T capability detection + guide
                                          (Linux: full channel scan & playback)
 ```
@@ -94,6 +96,53 @@ macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 (radio works; TV does not).
 
 ---
+
+## What's new in v1.6.0
+
+**Preset change notifications.** Every change to the 20-preset bank
+(auto-fill after a scheduled re-sweep, fill-from-sweep, online PI lookup
+renames, AI naming) bumps a change counter and leaves a diff (added /
+renamed / removed). Enable **Notify** in the STATIONS header and the
+browser raises a desktop notification whenever the bank changes — with
+in-page toast fallback when notifications are blocked. Your own edits
+from the same tab do not ping you.
+
+**PI-based online callsign lookup.** RDS gives the PI code even when the
+station name never decodes. After each sweep the receiver asks online PI
+databases (fmscan.org, fmdx.pl, or your own URL template — Agent →
+`pi_lookup_url`) to resolve PI codes that only got a generic "FM 96.1"
+name, then renames the sweep results and the matching unlocked presets.
+Results are cached in `pi_cache.json` (positive 30 days, negative 6 h),
+everything degrades gracefully offline, and `GET /api/pi/2A5B` plus the
+agent command *"lookup pi 2A5B"* do the same on demand.
+
+**AM sweep sensitivity.** A fixed absolute threshold cannot work on AM:
+the noise floor moves with daytime/nighttime propagation and local QRM.
+Before the AM segment of a sweep, a probe pass measures the band's noise
+floor and the AM threshold becomes floor + margin — **high** = 3 dB,
+**medium** = 6 dB, **low** = 12 dB (select next to the SWEEP row,
+persisted in the agent config). The measured floor and threshold are
+shown under the sweep row, and AM channels get a longer dwell because
+direct-sampling retunes settle slowly.
+
+**Sound Studio.** A proper audio chain between the demodulator and your
+speakers: 5-band EQ (bass / low mid / mid / presence / treble) plus a
+dynamics compressor. Seven presets — Studio, Music, Speech, AM Warm,
+NOAA, Airband, Night — and an **AUTO** mode that picks the right one from
+the station type: NOAA weather radio gets alert clarity, airband gets a
+comms bandpass with firm compression, speech PTYs (News, Talk, Sports…)
+get an intelligibility curve, music gets a smiley, AM gets its warmth.
+Per-preset EQ trims are saved in the browser, and an output VU meter with
+peak indicator closes the loop.
+
+**Under the hood.** The spectrum websocket now sends a prebuilt snapshot
+(prepared on the capture thread) instead of touching engine internals
+from the event loop, sends lightweight progress-only frames during
+sweeps, and every websocket send runs under a watchdog so a wedged
+transport can never freeze a handler — clients reconnect transparently.
+The simulated AM generator was also fixed to keep up with realtime (it
+was ~2.6x too slow, which made sim-AM audio stretch and the pipeline
+starve), and sweep AM scans are stable on long runs.
 
 ## What's new in v1.5.0
 

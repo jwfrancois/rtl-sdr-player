@@ -7,6 +7,7 @@ Run:  python app.py            (opens http://localhost:8515 in your browser)
 import argparse
 import asyncio
 import threading
+import time
 import webbrowser
 from pathlib import Path
 
@@ -204,7 +205,8 @@ async def api_sweep(body: dict):
                           if body.get("threshold_db") is not None else None),
             dwell_s=(float(body["dwell_s"])
                      if body.get("dwell_s") is not None else None),
-            from_hz=body.get("from_hz"), to_hz=body.get("to_hz"))
+            from_hz=body.get("from_hz"), to_hz=body.get("to_hz"),
+            am_sensitivity=body.get("am_sensitivity"))
     except (ValueError, TypeError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     return {"ok": True, **res, "scan": engine.scan_status()}
@@ -330,6 +332,16 @@ async def api_agent_enrich():
         return {"ok": False, "error": msg}
 
 
+@app.get("/api/pi/{pi}")
+async def api_pi_lookup(pi: str):
+    """Resolve an RDS PI code to a station name via the online PI
+    databases (local cache in front). Lookup failures are data, never
+    500s: offline the answer is {"ok": false, "error": ...}."""
+    from backend import agent as agent_mod
+    return await asyncio.to_thread(
+        agent_mod.pi_lookup, pi, dict(engine.agent))
+
+
 @app.get("/api/tv/status")
 async def api_tv_status():
     return {"status": tv.status(), "channels": tv.list_channels(),
@@ -386,45 +398,70 @@ async def ws_audio(ws: WebSocket):
             gen = eng.current_gen()
             chunks = eng.drain_sub(sub_id)
             if gen != last_gen:
-                await ws.send_json({"event": "reset",
+                await _ws_send(ws, {"event": "reset",
                                     "target_ms": int(eng.conf["audio_target_buffer_s"] * 1000)})
                 last_gen = gen
             for chunk in chunks:
-                await ws.send_bytes(chunk.tobytes())
+                await _ws_send_bytes(ws, chunk.tobytes())
             await asyncio.sleep(0.01)
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
         eng.unsubscribe(sub_id)
+        await _ws_close(ws)
+
+
+async def _ws_send(ws, obj):
+    """Send with a watchdog: a wedged transport must never hold the
+    handler (and its subscriber queue) hostage forever — drop the socket
+    so the client's reconnect logic takes over."""
+    try:
+        await asyncio.wait_for(ws.send_json(obj), timeout=3.0)
+    except asyncio.TimeoutError:
+        raise RuntimeError("ws send watchdog")
+
+
+async def _ws_send_bytes(ws, data):
+    try:
+        await asyncio.wait_for(ws.send_bytes(data), timeout=3.0)
+    except asyncio.TimeoutError:
+        raise RuntimeError("ws send watchdog")
+
+
+async def _ws_close(ws):
+    try:
+        await ws.close()
+    except Exception:
+        pass
 
 
 @app.websocket("/ws/spectrum")
 async def ws_spectrum(ws: WebSocket):
     await ws.accept()
+    last_sweep_send = 0.0
     try:
         while True:
-            psd = engine.get_psd()
-            if psd:
-                await ws.send_json({
-                    "event": "psd",
-                    "gen": engine.current_gen(),
-                    "band": engine.band,
-                    "freq_hz": engine.freq,
-                    "demod_mode": engine.demod_mode(),
-                    "bfo_hz": engine.bfo_hz,
-                    "rds": engine.current_rds(),
-                    "scan": engine.scan_status(),
-                    "squelch_db": engine.squelch_db,
-                    "squelch_open": engine.squelch_open,
-                    "ctcss_hz": engine.ctcss_hz,
-                    "ctcss_dev_hz": engine._ctcss_dev_hz(),
-                    "ctcss_open": engine._ctcss_open(),
-                    "chan_db": engine.chan_db,
-                    **psd})
+            view = engine.get_view()
+            if view:
+                sc = view.get("scan") or {}
+                if sc.get("running") and sc.get("mode") == "sweep":
+                    # During a sweep the UI only needs scan progress; the
+                    # full 4 KB PSD at 10 fps over a fast-retuning engine
+                    # can wedge the WS transport (v1.6), so sweeps send a
+                    # lightweight view at 1 fps. Live listening stays 10 fps.
+                    now = time.monotonic()
+                    if now - last_sweep_send >= 0.9:
+                        last_sweep_send = now
+                        slim = {k: v for k, v in view.items()
+                                if k != "psd_db"}
+                        await _ws_send(ws, slim)
+                else:
+                    last_sweep_send = 0.0
+                    await _ws_send(ws, view)
             await asyncio.sleep(0.1)
     except (WebSocketDisconnect, RuntimeError):
         pass
-
+    await _ws_close(ws)
 
 # Static UI (registered last so API routes take precedence)
 app.mount("/", StaticFiles(directory=str(WEB), html=True), name="web")

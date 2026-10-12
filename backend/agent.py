@@ -17,6 +17,8 @@ import time
 import urllib.error
 import urllib.request
 
+from . import pi_db as pi_db_mod
+
 # Persisted to agent_config.json by the engine (stream.py).
 AGENT_DEFAULTS = {
     # background re-sweep schedule
@@ -30,12 +32,30 @@ AGENT_DEFAULTS = {
     "llm_model": "",               # e.g. gpt-4o-mini
     "llm_api_key": "",             # stays on this machine
     "auto_enrich": True,           # AI-name presets after scheduled sweeps
+    # v1.6: AM sweep sensitivity + PI-code online callsign lookup
+    "am_sensitivity": "medium",    # low | medium | high (noise-floor margin)
+    "pi_lookup_enabled": True,     # resolve PI codes via online databases
+    "pi_lookup_url": "",           # optional custom URL template with {pi}
 }
 
 
 class AgentError(Exception):
     """Raised for LLM/network failures; always converted to a friendly
     reply upstream, never allowed to take the app down."""
+
+
+# ----------------------------------------------------------------------
+# PI-code online callsign lookup (v1.6; cache-fronted, never raises)
+# ----------------------------------------------------------------------
+def pi_lookup(pi, acfg, force=False):
+    """Resolve a PI code to a station name via the online databases.
+    See backend/pi_db.py for the provider chain; failures are data
+    ({"ok": False, ...}), never exceptions."""
+    try:
+        return pi_db_mod.lookup_pi(pi, acfg, force=force)
+    except Exception as exc:      # belt & braces on top of the module guard
+        return {"ok": False, "pi": pi, "name": None, "source": None,
+                "cached": False, "error": str(exc)[:80]}
 
 
 # ----------------------------------------------------------------------
@@ -288,6 +308,7 @@ HELP = (
     "I can: tune 101.7 | am 1010 | 121.5 | 162.550 · "
     "scan fm / am / noaa / airband · sweep all (or: sweep fm wx) · "
     "stop scan · next / previous station · report (what's on?) · "
+    "lookup pi 2A5B (online callsign lookup) · "
     "name the stations (AI) · sweep every 30 minutes / sweeps off · "
     "status. With an LLM configured I also understand fuzzier requests."
 )
@@ -400,6 +421,13 @@ def _dispatch(action, args, engine, acfg):
         return (f"AI named {res['updated']} presets"
                 + ("." if res["updated"] else
                    " — nothing needed a name."))
+    if action == "lookup":
+        res = pi_lookup(args.get("pi"), acfg)
+        if res.get("ok"):
+            return (f'PI {res["pi"]}: {res["name"]}'
+                    + (f' ({res["source"]})' if res.get("source") else ""))
+        return (f'PI {args.get("pi") or "?"}: '
+                f'{res.get("error") or "no match (offline)"}')
     if action == "schedule":
         return _apply_schedule(engine, args.get("minutes", 0), acfg)
     if action == "status":
@@ -476,6 +504,13 @@ def _execute_command(engine, text, acfg):
         return done("sweep", _dispatch("sweep", {"bands": bands},
                                        engine, acfg))
 
+    # PI code online lookup: "lookup pi 2A5B", "pi F301", "identify BEEF"
+    m = re.search(r"\b([0-9a-f]{4})\b", low)
+    if m and re.search(r"\b(pi|lookup|identify|callsign)\b", low):
+        pi = m.group(1).upper()
+        reply = _dispatch("lookup", {"pi": pi}, engine, acfg)
+        return done("lookup", reply, pi=pi)
+
     # scan a band list
     m = re.search(r"\bscan\b\s*(fm|am|wx|noaa|weather|airband|air)?", low)
     if m:
@@ -526,6 +561,7 @@ def _execute_command(engine, text, acfg):
                              '{"action":"next","args":{}} | {"action":"prev","args":{}} | '
                              '{"action":"report","args":{}} | '
                              '{"action":"enrich","args":{}} | '
+                             '{"action":"lookup","args":{"pi":"4 hex digits"}} | '
                              '{"action":"schedule","args":{"minutes":number (0=off)}} | '
                              '{"action":"status","args":{}} | '
                              "Pick the single closest action. JSON only."},
@@ -540,6 +576,10 @@ def _execute_command(engine, text, acfg):
                 args.setdefault("band", None)
                 if not isinstance(args.get("freq_hz"), (int, float)):
                     raise AgentError("no freq_hz")
+            if action == "lookup":
+                if not re.fullmatch(r"[0-9A-Fa-f]{4}",
+                                    str(args.get("pi") or "")):
+                    raise AgentError("no 4-digit hex pi")
             reply = _dispatch(action, args, engine, acfg)
             if reply is not None:
                 return done(action + " (ai)", reply)

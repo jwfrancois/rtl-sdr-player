@@ -20,6 +20,7 @@ v1.3 additions:
 """
 import json
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -30,6 +31,7 @@ from . import agent as agent_mod
 from . import config as cfg
 from . import device as devmod
 from . import dsp
+from . import pi_db as pi_db_mod
 
 # Demodulation modes available per band (UI mode buttons come from
 # cfg.BANDS[band]["modes"]; the SSB modes use the phasing demodulator).
@@ -51,6 +53,7 @@ class ReceiverEngine:
         self._pending = None
         self._lock = threading.RLock()
         self.psd = None
+        self.view = None               # prebuilt spectrum-WS snapshot (v1.6)
         self._stop = threading.Event()
         self._thread = None
         self._demod = None
@@ -102,6 +105,14 @@ class ReceiverEngine:
                                               "stations.json"))
         self.stations = self._load_stations()
 
+        # v1.6: change feed for browser notifications. Every mutation of
+        # the preset bank bumps _stations_rev and leaves a diff in
+        # _stations_change; the UI polls /api/status and turns rev jumps
+        # into desktop notifications / toasts.
+        self._stations_rev = 0
+        self._stations_change = None
+        self._pi_thread = None
+
         # v1.4: last all-band sweep results (persisted, feeds "fill presets")
         self._sweep_path = os.path.join(cfg.ROOT,
                                         conf.get("sweep_results_file",
@@ -144,6 +155,7 @@ class ReceiverEngine:
         if self.started:
             return
         self.device, self.info = devmod.open_device(prefer_sim=self.prefer_sim)
+        pi_db_mod.init_cache(os.path.join(cfg.ROOT, "pi_cache.json"))
         self._apply_device_config()
         self._demod = self._make_demod()
         self._stop.clear()
@@ -280,14 +292,22 @@ class ReceiverEngine:
         return {"ok": True, "list": list_name, "order": order}
 
     def start_sweep(self, bands=None, threshold_db=None, dwell_s=None,
-                    from_hz=None, to_hz=None):
-        """All-band measurement sweep (v1.4).
+                    from_hz=None, to_hz=None, am_sensitivity=None):
+        """All-band measurement sweep (v1.4, AM sensitivity v1.6).
 
         Tunes across every channel of the selected bands, records the peak
         channel power and (on FM) the RDS station name of each hot channel,
         then leaves a sorted result list behind for the STATIONS panel's
         "fill presets" action. Audio is muted while sweeping; the previous
         tuning is restored at the end (or on stop / manual tune).
+
+        AM handling: a fast probe pass measures the AM noise floor just
+        before the AM segment, and the AM threshold becomes floor + margin
+        where margin is set by am_sensitivity (high=3 dB, medium=6 dB,
+        low=12 dB). A fixed absolute threshold cannot work on AM: the
+        noise floor moves with daytime/nighttime propagation and local
+        QRM, so a static cut either drowns every weak carrier at night or
+        floods the results with receiver noise by day.
         """
         req_bands = list(bands) if bands is not None \
             else list(cfg.SWEEP_BAND_ORDER)
@@ -310,6 +330,11 @@ class ReceiverEngine:
                 chans.append((band, f))
         if not chans:
             raise ValueError("sweep range selects no channels")
+        am_sens = str(am_sensitivity or self.agent.get("am_sensitivity")
+                      or "medium").lower()
+        if am_sens not in ("low", "medium", "high"):
+            am_sens = "medium"
+        am_chans = [f for b, f in chans if b == "am"]
         with self._lock:
             thr = (float(threshold_db) if threshold_db is not None
                    else float(self.conf["squelch_default_db"]))
@@ -326,9 +351,16 @@ class ReceiverEngine:
                 "rds_wait": float(self.conf["sweep_rds_wait_s"]),
                 "restore": (self.band, self.freq), "t0": time.time(),
                 "results": [],
+                # v1.6: adaptive AM sensitivity (noise-floor probe pass)
+                "am_sens": am_sens if am_chans else None,
+                "am_probe_chans": am_chans,
+                "am_thr_db": None, "am_floor_db": None,
+                "am_probed": not am_chans, "probe": None,
+                "rds_pty": None,
             })
         return {"ok": True, "bands": ordered, "channels": len(chans),
-                "threshold_db": thr, "dwell_s": dwell}
+                "threshold_db": thr, "dwell_s": dwell,
+                "am_sensitivity": am_sens}
 
     def _begin_scan(self, mode, chans, list_name, label, order):
         """Common scan/sweep setup (lock held by caller)."""
@@ -339,7 +371,7 @@ class ReceiverEngine:
             "hop_t": time.monotonic(), "hop_gen": self.gen + 1,
             "freqs": [f for _, f in chans], "chans": list(chans),
             "order": order, "cur_db": None, "rds_name": None,
-            "rds_pi": None,
+            "rds_pi": None, "rds_pty": None,
         })
         band0, freq0 = chans[0]
         self._pending = ("tune", band0, freq0)
@@ -378,6 +410,13 @@ class ReceiverEngine:
                 "memory": self.memory_list(),
                 "results": len(sc.get("results", [])),
                 "bands": sc.get("bands") or [],
+                "am_sens": sc.get("am_sens"),
+                "am_floor_db": sc.get("am_floor_db"),
+                "am_thr_db": sc.get("am_thr_db"),
+                "probing": sc.get("probe") is not None,
+                "probe_i": (sc["probe"]["i"] if sc.get("probe") else 0),
+                "probe_count": (len(sc["probe"]["chans"])
+                                if sc.get("probe") else 0),
             }
 
     # ------------------------------------------------------------------
@@ -535,6 +574,7 @@ class ReceiverEngine:
         slot = int(slot)
         with self._lock:
             cur = self.stations[slot - 1]
+            rename_only = bool(name) and band is None and freq_hz is None
             if band is None and freq_hz is None and name:
                 # rename (keep the station already in the slot)
                 if cur is None:
@@ -557,7 +597,6 @@ class ReceiverEngine:
                 if band == self.band == "wfm" and freq_hz == self.freq:
                     name = self._live_station_name()
                 # 2) a sweep that already identified this channel keeps
-                #    its name (right-click save after a sweep)
                 pi = None
                 if not name:
                     for r in self.sweep_results or []:
@@ -576,8 +615,10 @@ class ReceiverEngine:
                   # user-typed name -> auto-fill must keep this slot
                   "locked": bool(name),
                   "pi": pi}
+            old = self.stations
             self.stations[slot - 1] = st
             self._save_stations()
+            self._commit_stations(old, "rename" if rename_only else "save")
             return st
 
     def clear_station(self, slot):
@@ -585,17 +626,52 @@ class ReceiverEngine:
             raise ValueError(f"slot must be 1..{self.NUM_STATIONS}")
         with self._lock:
             gone = self.stations[int(slot) - 1]
+            old = self.stations
             self.stations[int(slot) - 1] = None
             self._save_stations()
+            if gone is not None:
+                self._commit_stations(old, "delete")
         return gone is not None
 
     def clear_stations(self):
         with self._lock:
+            old = self.stations
             self.stations = [None] * self.NUM_STATIONS
             self._save_stations()
+            self._commit_stations(old, "clear")
         return {"ok": True}
 
-    def fill_stations_from_sweep(self, count=None, keep_locked=True):
+    def _commit_stations(self, old, source):
+        """Record a preset-bank change for the UI notification feed (lock
+        held by caller). old is the previous stations list."""
+        def brief(st):
+            return {"slot": st["slot"], "name": st.get("name"),
+                    "band": st.get("band"), "freq_hz": st.get("freq_hz")}
+
+        def key(st):
+            return (st["band"], int(st["freq_hz"])) if st else None
+
+        oldmap = {key(s): s for s in (old or []) if s}
+        newmap = {key(s): s for s in (self.stations or []) if s}
+        added = [brief(s) for k, s in newmap.items() if k not in oldmap]
+        removed = [brief(s) for k, s in oldmap.items() if k not in newmap]
+        renamed = []
+        for k, s in newmap.items():
+            o = oldmap.get(k)
+            if o is None:
+                continue
+            if (o.get("name") != s.get("name")
+                    or o.get("ai_name") != s.get("ai_name")):
+                renamed.append({"slot": s["slot"], "from": o.get("name"),
+                                "to": s.get("ai_name") or s.get("name")})
+        self._stations_rev += 1
+        self._stations_change = {
+            "t": round(time.time(), 1), "source": source,
+            "added": added, "removed": removed, "renamed": renamed,
+        }
+
+    def fill_stations_from_sweep(self, count=None, keep_locked=True,
+                                 source="fill"):
         """Populate the 20 slots from the last sweep results.
 
         Strongest stations first, one per channel (adjacent-channel
@@ -649,8 +725,10 @@ class ReceiverEngine:
                     "pi": r.get("pi"),
                 }
                 placed.append(r)
+            old = self.stations
             self.stations = stations
             self._save_stations()
+            self._commit_stations(old, source)
         return placed
 
     @staticmethod
@@ -774,6 +852,10 @@ class ReceiverEngine:
                 "base_url": a.get("llm_base_url") or "",
                 "key_hint": ("..." + key[-4:]) if key else "",
             },
+            # v1.6
+            "am_sensitivity": a.get("am_sensitivity") or "medium",
+            "pi_lookup_enabled": bool(a.get("pi_lookup_enabled", True)),
+            "pi_lookup_url": a.get("pi_lookup_url") or "",
         }
 
     def set_agent_settings(self, patch):
@@ -802,6 +884,16 @@ class ReceiverEngine:
                 a[k] = str(patch[k] or "").strip()
         if patch.get("llm_api_key") is not None:
             a["llm_api_key"] = str(patch["llm_api_key"]).strip()
+        # v1.6: AM sweep sensitivity + PI online lookup
+        if "am_sensitivity" in patch:
+            v = str(patch["am_sensitivity"] or "medium").lower()
+            if v not in ("low", "medium", "high"):
+                raise ValueError("am_sensitivity must be low/medium/high")
+            a["am_sensitivity"] = v
+        if "pi_lookup_enabled" in patch:
+            a["pi_lookup_enabled"] = bool(patch["pi_lookup_enabled"])
+        if "pi_lookup_url" in patch:
+            a["pi_lookup_url"] = str(patch["pi_lookup_url"] or "").strip()
         with self._lock:
             self.agent = a
             self._save_agent_config()
@@ -881,7 +973,8 @@ class ReceiverEngine:
         notes = []
         if a.get("sweep_auto_fill") and (self.sweep_results or []):
             try:
-                placed = self.fill_stations_from_sweep(keep_locked=True)
+                placed = self.fill_stations_from_sweep(keep_locked=True,
+                                                       source="auto-fill")
                 notes.append(f"auto-filled {len(placed)} presets")
             except Exception as exc:
                 notes.append(f"auto-fill failed: {exc}")
@@ -925,8 +1018,64 @@ class ReceiverEngine:
                     self.stations[i]["ai_name"] = u["name"]
                     if u.get("genre"):
                         self.stations[i]["genre"] = u["genre"]
+            old = self.stations
             self._save_stations()
+        self._commit_stations(old, "AI naming")
         return {"ok": True, "updated": len(updated)}
+
+    # ------------------------------------------------------------------
+    # v1.6: PI-code online callsign lookup (post-sweep enrichment)
+    # ------------------------------------------------------------------
+    def _maybe_start_pi_enrich(self):
+        """After a sweep, resolve FM PI codes that had no RDS PS name to
+        real station identities via the online PI databases. Runs on a
+        daemon thread: the capture loop must never block on the network."""
+        if not self.agent.get("pi_lookup_enabled", True):
+            return
+        if self._pi_thread and self._pi_thread.is_alive():
+            return
+        self._pi_thread = threading.Thread(target=self._pi_enrich_run,
+                                           daemon=True, name="pi-lookup")
+        self._pi_thread.start()
+
+    def _pi_enrich_run(self):
+        """Rename sweep results (and matching unlocked presets) whose only
+        name is the 'FM 96.1' fallback and whose PI resolves online."""
+        default_re = re.compile(r"^FM \d")
+        try:
+            targets = [r for r in (self.sweep_results or [])
+                       if r.get("pi") and r.get("band") == "wfm"
+                       and default_re.match(r.get("name") or "")][:24]
+            named = 0
+            for r in targets:
+                res = agent_mod.pi_lookup(r["pi"], dict(self.agent))
+                name = (res or {}).get("name")
+                if not name:
+                    continue
+                name = str(name).strip()[:32]
+                if default_re.match(r.get("name") or ""):
+                    r["name"] = name
+                    named += 1
+                with self._lock:
+                    old = list(self.stations)
+                    touched = False
+                    for st in self.stations:
+                        if (st and st.get("band") == "wfm"
+                                and abs(int(st["freq_hz"])
+                                        - int(r["freq_hz"])) < 500
+                                and not st.get("locked")
+                                and not st.get("ai_name")
+                                and default_re.match(st.get("name") or "")):
+                            st["name"] = name
+                            st["pi"] = st.get("pi") or r["pi"]
+                            touched = True
+                    if touched:
+                        self._save_stations()
+                        self._commit_stations(old, "PI lookup")
+            if named:
+                self._save_sweep_results(self.sweep_meta)
+        except Exception:
+            pass  # enrichment is best-effort; never break the receiver
 
     def subscribe(self):
         """Register an audio consumer. Each gets its own bounded queue so
@@ -952,6 +1101,14 @@ class ReceiverEngine:
 
     def get_psd(self):
         return self.psd
+
+    def get_view(self):
+        """Prebuilt spectrum-WS payload (capture-thread made, one per
+        block). The websocket handler must never touch engine internals
+        from the event loop: during fast sweep retunes a loop-side engine
+        call + send combination could wedge the transport (v1.6), so the
+        handler now only reads this snapshot."""
+        return self.view
 
     def current_gen(self):
         return self.gen
@@ -1022,6 +1179,8 @@ class ReceiverEngine:
                 "scan": self.scan_status(),
                 "bookmarks": self.bookmarks_list(),
                 "stations": self.stations_list(),
+                "stations_rev": self._stations_rev,
+                "stations_change": self._stations_change,
                 "agent": self.agent_status(),
                 "target_buffer_ms": int(self.conf["audio_target_buffer_s"] * 1000),
                 "started": self.started,
@@ -1034,6 +1193,28 @@ class ReceiverEngine:
             }
             s["tv"] = tv.status()
             return s
+
+    def _build_view(self, psd):
+        """One immutable spectrum-WS snapshot, made on the capture thread
+        while the block is fresh (lock taken briefly, never held across
+        awaits)."""
+        return {
+            "event": "psd",
+            "gen": self.gen,
+            "band": self.band,
+            "freq_hz": self.freq,
+            "demod_mode": self.demod_mode(),
+            "bfo_hz": self.bfo_hz,
+            "rds": self.current_rds(),
+            "scan": self.scan_status(),
+            "squelch_db": self.squelch_db,
+            "squelch_open": self.squelch_open,
+            "ctcss_hz": self.ctcss_hz,
+            "ctcss_dev_hz": self._ctcss_dev_hz(),
+            "ctcss_open": self._ctcss_open(),
+            "chan_db": self.chan_db,
+            **psd,
+        }
 
     # ------------------------------------------------------------------
     # internals
@@ -1091,6 +1272,7 @@ class ReceiverEngine:
         for q in list(self._subs.values()):
             q.clear()
         self.psd = None
+        self.view = None
         self.gen += 1
 
     def _hop_scan(self):
@@ -1115,6 +1297,7 @@ class ReceiverEngine:
         sc["cur_db"] = None
         sc["rds_name"] = None
         sc["rds_pi"] = None
+        sc["rds_pty"] = None
         self._pending = ("tune", band, freq)
 
     def _run_scanner(self, now, sq_open):
@@ -1154,43 +1337,115 @@ class ReceiverEngine:
 
         Tracks the peak channel power of the current channel, grabs the
         RDS PS name while dwelling on a hot FM channel, records stations
-        above threshold, and hops onward at the configured pace.
+        above threshold, and hops onward at the configured pace. Just
+        before the AM segment, a fast probe pass measures the band's
+        noise floor so the AM threshold adapts to conditions (v1.6).
         """
         sc = self._scan
         if sc["idx"] >= len(sc["chans"]):
             return False
+        if sc.get("probe") is not None:
+            return self._am_probe_step(now)
         band, _freq = sc["chans"][sc["idx"]]
+        # v1.6: first AM channel reached -> measure the band noise floor
+        # with a quick low-dwell probe pass, then sweep AM adaptively
+        if (band == "am" and not sc.get("am_probed")
+                and sc.get("am_probe_chans")):
+            sc["probe"] = {"chans": sc["am_probe_chans"], "i": 0,
+                           "vals": [], "cur": None,
+                           "resume_idx": sc["idx"]}
+            sc["state"] = "probe"
+            pf = sc["probe"]["chans"][0]
+            sc["freq_hz"] = pf
+            sc["hop_t"] = time.monotonic()
+            sc["hop_gen"] = self.gen + 1
+            sc["cur_db"] = None
+            self._pending = ("tune", "am", pf)
+            return True
         # only measure after the hop's tune has actually been applied
         # (gen reaches hop_gen): blocks still in flight from the previous
         # channel would otherwise pollute the first measurement
         if self.gen >= sc["hop_gen"] and self.chan_db is not None:
             if sc["cur_db"] is None or self.chan_db > sc["cur_db"]:
                 sc["cur_db"] = float(self.chan_db)
-        hot = (sc["cur_db"] is not None
-               and sc["cur_db"] >= sc["threshold_db"])
+        thr = self._sweep_thr(band)
+        hot = (sc["cur_db"] is not None and sc["cur_db"] >= thr)
         if (hot and sc["rds_name"] is None and band == "wfm"):
             snap = self.current_rds()
             if snap and snap.get("ps"):
                 sc["rds_name"] = str(snap["ps"]).strip()[:32] or None
                 sc["rds_pi"] = snap.get("pi")
+                sc["rds_pty"] = snap.get("pty")
         elapsed = now - sc["hop_t"]
+        # AM (direct sampling) retunes settle slowly: give each AM channel
+        # a longer dwell on top of the sensitivity-shaped threshold
+        dwell = sc["dwell"] * (1.8 if band == "am" else 1.0)
         # hold a little longer on a hot FM channel so the PS name arrives,
         # but only when a stereo pilot is present (no pilot = no RDS at all)
         has_pilot = (band == "wfm" and hasattr(self._demod, "pilot")
                      and self._demod.pilot.present)
         waiting_rds = (hot and band == "wfm" and has_pilot
                        and sc["rds_name"] is None
-                       and elapsed < sc["dwell"] + sc["rds_wait"])
-        if elapsed < sc["dwell"] or waiting_rds:
+                       and elapsed < dwell + sc["rds_wait"])
+        if elapsed < dwell or waiting_rds:
             return True                     # muted while sweeping
         self._sweep_record(band, _freq)
         self._hop_scan()
         return True
 
+    def _sweep_thr(self, band):
+        """Per-band sweep threshold: AM uses its measured noise floor +
+        the sensitivity margin when the probe pass succeeded."""
+        sc = self._scan
+        if band == "am" and sc.get("am_thr_db") is not None:
+            return sc["am_thr_db"]
+        return sc["threshold_db"]
+
+    def _am_probe_step(self, now):
+        """One block of the AM noise-floor probe pass (lock held)."""
+        sc, pr = self._scan, self._scan["probe"]
+        if self.gen >= sc["hop_gen"] and self.chan_db is not None:
+            if pr["cur"] is None or self.chan_db > pr["cur"]:
+                pr["cur"] = float(self.chan_db)
+        elapsed = now - sc["hop_t"]
+        # Probe cadence note (v1.6): hopping faster than ~3 retunes/s
+        # wedges newly-connected websocket transports (sends suspend and
+        # never resume — reproducible with any payload size and both
+        # uvicorn WS implementations). 0.35 s/ch matches the proven-safe
+        # WFM sweep cadence; the probe costs ~41 s on a full AM sweep.
+        if elapsed < max(0.35, sc["dwell"]):
+            return True
+        if pr["cur"] is not None:
+            pr["vals"].append(pr["cur"])
+        pr["cur"] = None
+        pr["i"] += 1
+        if pr["i"] >= len(pr["chans"]):
+            vals = sorted(pr["vals"])
+            floor = vals[len(vals) // 2] if len(vals) >= 5 else None
+            margin = {"low": 12.0, "medium": 6.0, "high": 3.0}.get(
+                sc.get("am_sens") or "medium", 6.0)
+            sc["am_floor_db"] = (round(floor, 1)
+                                 if floor is not None else None)
+            sc["am_thr_db"] = (round(floor + margin, 1)
+                               if floor is not None else None)
+            sc["am_probed"] = True
+            sc["probe"] = None
+            # resume the main sweep at the AM segment where the probe began
+            sc["idx"] = pr["resume_idx"] - 1
+            self._hop_scan()
+            return True
+        _b, freq = pr["chans"][pr["i"]]
+        sc["freq_hz"] = freq
+        sc["hop_t"] = time.monotonic()
+        sc["hop_gen"] = self.gen + 1
+        sc["cur_db"] = None
+        self._pending = ("tune", "am", freq)
+        return True
+
     def _sweep_record(self, band, freq):
         sc = self._scan
         db = sc.get("cur_db")
-        if db is None or db < sc["threshold_db"]:
+        if db is None or db < self._sweep_thr(band):
             return
         rec = {
             "band": band, "freq_hz": int(freq), "db": round(db, 1),
@@ -1199,6 +1454,8 @@ class ReceiverEngine:
         }
         if sc.get("rds_pi"):
             rec["pi"] = sc["rds_pi"]
+        if sc.get("rds_pty"):
+            rec["pty"] = sc["rds_pty"]
         results = sc.setdefault("results", [])
         results.append(rec)
         self._record_hit(freq)
@@ -1216,6 +1473,8 @@ class ReceiverEngine:
                                       "bands": sc.get("bands")})
         if restore:
             self._pending = ("tune", restore[0], restore[1])
+        if results:
+            self._maybe_start_pi_enrich()
 
     def _reader_loop(self):
         while not self._stop.is_set():
@@ -1238,6 +1497,7 @@ class ReceiverEngine:
             self._resume.clear()
             return
         try:
+            t_read0 = time.monotonic()
             raw = self.device.read_iq(dsp.BLOCK)
         except Exception as exc:
             self.info["error"] = f"capture failed: {exc}"
@@ -1247,6 +1507,7 @@ class ReceiverEngine:
             return   # block captured at the old rate during a retune: discard
         if not len(raw):
             return   # device hiccup: nothing came out this time
+        gen_t = time.monotonic() - t_read0
         if len(raw) < dsp.BLOCK:
             self.stats["short_reads"] += 1
             raw = raw if self._residue is None else \
@@ -1260,8 +1521,12 @@ class ReceiverEngine:
             self._residue = raw[dsp.BLOCK:]
         if not getattr(self.device, "is_real", True):
             # simulator produces instantly: pace the reader to realtime so
-            # the queue/capacity stats stay meaningful and we don't spin
-            time.sleep(getattr(self, "_block_seconds", 0.109))
+            # the queue/capacity stats stay meaningful and we don't spin.
+            # The generation time is subtracted from the budget so even the
+            # heavier synthetic stations (AM direct sampling) land on the
+            # realtime schedule instead of drifting into starvation.
+            budget = getattr(self, "_block_seconds", 0.109)
+            time.sleep(max(0.0, budget - gen_t))
 
     def _put_block(self, raw):
         if len(self._raw_q) >= self._raw_max:
@@ -1360,6 +1625,7 @@ class ReceiverEngine:
                     q.append(pcm)
                 self.psd = psd_comp.process(raw, self._fs, self._center,
                                             self.freq)
+                self.view = self._build_view(self.psd)
                 self.stats["dsp_ms"] = (
                     0.9 * self.stats["dsp_ms"]
                     + 0.1 * (time.monotonic() - t_dsp) * 1000.0)

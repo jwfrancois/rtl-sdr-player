@@ -474,6 +474,69 @@ async def main():
     # restore pre-sweep-ish tuning for later/next runs
     rest("/api/tune", {"band": "wfm", "freq_hz": 98_300_000})
 
+    # ---- 12. v1.6: notification feed, PI lookup, AM sensitivity ----
+    st = rest("/api/status")
+    check("stations_rev in status",
+          isinstance(st.get("stations_rev"), int), str(st.get("stations_rev")))
+    check("stations_change in status",
+          "stations_change" in st, type(st.get("stations_change")).__name__)
+    r = rest("/api/agent/config", {"am_sensitivity": "high"})
+    check("am_sensitivity persisted", r["agent"]["am_sensitivity"] == "high",
+          str(r.get("agent", {}).get("am_sensitivity")))
+    try:
+        rest("/api/agent/config", {"am_sensitivity": "banana"})
+        check("bad am_sensitivity rejected", False)
+    except urllib.error.HTTPError as exc:
+        check("bad am_sensitivity rejected", exc.code == 400,
+              f"HTTP {exc.code}")
+    rest("/api/agent/config", {"am_sensitivity": "medium"})
+    r = rest("/api/sweep", {"bands": ["wfm"], "from_hz": 95_900_000,
+                            "to_hz": 96_300_000, "dwell_s": 0.2,
+                            "am_sensitivity": "low"})
+    check("sweep accepts am_sensitivity", r.get("ok") is True
+          and r.get("am_sensitivity") == "low", json.dumps(r)[:90])
+    deadline = time.time() + 25
+    sr = rest("/api/sweep/results")
+    while time.time() < deadline and sr.get("running"):
+        await asyncio.sleep(0.4)
+        sr = rest("/api/sweep/results")
+    check("segment sweep still finds sim station",
+          not sr.get("running") and len(sr.get("results", [])) == 1,
+          str(len(sr.get("results", []))))
+    rest("/api/sweep/stop", {})
+    r = rest("/api/stations/fill", {})
+    check("fill after v1.6 sweep ok", r.get("ok") is True
+          and r.get("filled") == 1, str(r.get("filled")))
+    st2 = rest("/api/status")
+    ch = st2.get("stations_change") or {}
+    check("fill bumps stations_rev + change feed",
+          st2["stations_rev"] > st["stations_rev"]
+          and ch.get("source") == "fill"
+          and len(ch.get("added") or []) == 1,
+          json.dumps(ch)[:110])
+    rest("/api/stations/clear", {})
+    try:
+        r = json.loads(urllib.request.urlopen(BASE + "/api/pi/2A5B",
+                                              timeout=25).read())
+        check("pi lookup endpoint answers gracefully",
+              r.get("pi") == "2A5B" and "ok" in r, json.dumps(r)[:90])
+    except urllib.error.HTTPError as exc:
+        check("pi lookup endpoint answers gracefully", False,
+              f"HTTP {exc.code}")
+    r = rest("/api/agent/command", {"text": "lookup pi 2A5B"})
+    check("agent lookup command", r.get("ok") is True
+          and r.get("action") == "lookup", r.get("reply", "")[:60])
+    r = rest("/api/agent/command", {"text": "am 1010"})
+    check("am tune not confused with pi lookup",
+          r.get("ok") is True and r.get("action") == "tune",
+          r.get("reply", "")[:60])
+    await asyncio.sleep(0.6)     # tune applies between capture blocks
+    st = rest("/api/status")
+    check("am tune applied", st["band"] == "am"
+          and abs(st["freq_hz"] - 1_010_000) < 500,
+          f"{st['band']} {st['freq_hz']}")
+    rest("/api/tune", {"band": "wfm", "freq_hz": 98_300_000})
+
     print()
     if fails:
         print("SMOKE TEST FAILURES:", fails)
