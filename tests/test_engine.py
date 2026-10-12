@@ -69,6 +69,18 @@ def main():
     ssb_ok = (usb[-1][0] > -40.0 and lsb[-1][0] > -40.0
               and cross[-1][0] < usb[-1][0] - 15.0)
 
+    # ---- DcBlocker (v1.7.1): kills discriminator DC, keeps programme bass
+    print("== DcBlocker: DC removed, bass kept ==")
+    dcb = dsp.DcBlocker(15.0, 48_000)
+    tt = np.arange(48_000) / 48_000.0
+    sig = 0.5 * np.sin(2 * np.pi * 220.0 * tt) + 0.4   # 220 Hz tone + DC
+    y = dcb.process(sig)
+    dc_out = float(np.mean(y[8000:]))                  # past the settle region
+    bass_rms = float(np.sqrt(np.mean(y[8000:] ** 2)))
+    print(f"  DC 0.400 -> {dc_out:+.4f};  bass rms {bass_rms:.3f} (0.354 ideal)")
+    dcb_ok = abs(dc_out) < 0.01 and bass_rms > 0.30
+
+
     # ---- full engine: RDS + squelch + scanner over REST-like calls ----
     print("== full engine: RDS on 96.1 ==")
     conf = cfg.load_config()
@@ -250,7 +262,7 @@ def main():
               and smart_ok and mem_cleared and auto_ok and auto_off_ok
               and ct_ok and ct_adj and ct_wob and ct_voice
               and wrong and right and ct_invalid
-              and bmk_ok and bmk_persist)
+              and bmk_ok and bmk_persist and dcb_ok)
         print("RESULT:", "PASS" if ok else
               f"FAIL (rds={rds_ok} squelch={sq_ok} scan={scan_ok} "
               f"ssb={ssb_ok} mem={mem_ok} smart={smart_ok} "

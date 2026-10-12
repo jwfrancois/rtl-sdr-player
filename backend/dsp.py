@@ -84,6 +84,33 @@ class Decimator:
         self.zi[:] = 0
 
 
+class DcBlocker:
+    """One-pole DC blocker (very low cutoff high-pass).
+
+    Real dongles feed the demodulators a little IQ imbalance and LO
+    leakage, and a station tuned a hair off DC shows up as a DC component
+    in the discriminator output. Left in place it becomes low-frequency
+    thump; worse, the FM de-emphasis that follows is a low-pass and keeps
+    every bit of it, eating headroom and dulling the audio. Blocking
+    everything below ~15 Hz removes the offset while leaving programme
+    bass untouched (FM broadcast carries no musical content that low).
+    """
+
+    def __init__(self, cutoff_hz=15.0, fs=AUDIO_RATE):
+        alpha = np.exp(-2.0 * np.pi * float(cutoff_hz) / float(fs))
+        self.b = np.array([1.0, -1.0])
+        self.a = np.array([1.0, -alpha])
+        self.zi = np.zeros(1)
+
+    def process(self, x):
+        y, self.zi = signal.lfilter(
+            self.b, self.a, np.asarray(x, dtype=np.float64), zi=self.zi)
+        return y
+
+    def reset(self):
+        self.zi[:] = 0
+
+
 class DeEmphasis:
     """Single-pole FM de-emphasis.
 
@@ -164,6 +191,9 @@ class WfmDemod:
         self.nco = NcoMixer(self.lo_offset, self.fs)
         self.dec1 = Decimator(10, 120_000, self.fs, numtaps=129)   # -> 240 kSPS
         self.dec2 = Decimator(5, 15_500, self.IF_RATE, numtaps=129)  # -> 48 kHz
+        # DC blocker before de-emphasis: de-emphasis is a low-pass and would
+        # otherwise preserve/boost any discriminator DC offset (v1.7.1)
+        self.dcblk = DcBlocker(15.0, AUDIO_RATE)
         self.deemph = DeEmphasis(de_emphasis_us)
         self.pilot = PilotWatch(self.IF_RATE)
         self.rds = rds_mod.RdsDecoder(self.IF_RATE)
@@ -192,13 +222,15 @@ class WfmDemod:
         self.rds.process(d)
         audio = d * (self.IF_RATE / (2.0 * np.pi * WFM_DEV_HZ))
         y = self.dec2.process(audio.astype(np.complex64))
-        audio = self.deemph.process(y.real.astype(np.float64))
+        audio = self.dcblk.process(y.real.astype(np.float64))
+        audio = self.deemph.process(audio)
         return to_int16(audio)
 
     def reset(self):
         self.nco.set_freq(self.lo_offset)
         self.dec1.reset()
         self.dec2.reset()
+        self.dcblk.reset()
         self.deemph.reset()
         self.pilot = PilotWatch(self.IF_RATE)
         self.rds = rds_mod.RdsDecoder(self.IF_RATE)
@@ -447,6 +479,8 @@ class SsbDemod:
         self.sb_b = (base * np.exp(
             sgn * 1j * 2.0 * np.pi * 1_725.0 * nn / AUDIO_RATE))
         self.sb_zi = np.zeros(len(self.sb_b) - 1, dtype=np.complex128)
+        # BFO mistuning appears as a DC/LF beat in y.real — block it (v1.7.1)
+        self.dcblk = DcBlocker(30.0, AUDIO_RATE)
         self._agc = 0.5
         self.last_chan_db = None
 
@@ -468,7 +502,7 @@ class SsbDemod:
         xb = x * np.exp(-1j * ph).astype(np.complex64)
         y, self.sb_zi = signal.lfilter(self.sb_b, 1.0,
                                        xb.astype(np.complex128), zi=self.sb_zi)
-        audio = y.real * 2.0
+        audio = self.dcblk.process(y.real * 2.0)
         # slow AGC like the AM path (SSB level wanders with the operator)
         peak = float(np.max(np.abs(audio)) + 1e-9)
         self._agc = 0.999 * self._agc + 0.001 * peak
@@ -479,6 +513,7 @@ class SsbDemod:
         self.dec1.reset()
         self.dec2.reset()
         self.sb_zi[:] = 0
+        self.dcblk.reset()
         self._bfo_ph = 0.0
         self._agc = 0.5
 

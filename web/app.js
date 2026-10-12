@@ -960,7 +960,9 @@ function buildStudioChain() {
   const analyser = actx.createAnalyser();
   analyser.fftSize = 512;
   const master = actx.createGain();
-  master.gain.value = 1.0;
+  // 0.9 leaves ~1 dB headroom: studio EQ boosts + compressor makeup gain
+  // can otherwise push loud passages past full scale and hard-clip
+  master.gain.value = 0.9;
   let prev = input;
   for (const f of filters) { prev.connect(f); prev = f; }
   prev.connect(comp);

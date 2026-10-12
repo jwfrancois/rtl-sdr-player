@@ -84,6 +84,7 @@ class ReceiverEngine:
         self.squelch_open = True
         self._sq_last_open = 0.0
         self._sq_user = False           # user has taken squelch control
+        self._sq_was_muted = False      # last block was gated (edge fades)
         self.chan_db = None             # live channel-power reading
 
         # CTCSS tone squelch (NBFM only): 0 disables, else a cfg.CTCSS_TONES
@@ -2074,11 +2075,27 @@ class ReceiverEngine:
 
                 # ---- scanner (holds must respect the full gate) ----
                 muted = self._run_scanner(now, eff_open)
-                # squelch gates audio on any band while enabled and closed
+                # squelch gates audio on any band while enabled and closed.
+                # Gate edges get a 4 ms ramp (v1.7.1): a hard block-boundary
+                # cut clicks audibly, most noticeably on NBFM/AM squelch
+                # tails and scanner hops.
                 if self.squelch_db is not None and not eff_open:
                     muted = True
                 if muted:
-                    pcm = np.zeros_like(pcm)
+                    if self._sq_was_muted:
+                        pcm = np.zeros_like(pcm)
+                    else:
+                        pcm = pcm.copy()
+                        nfade = min(192, len(pcm))      # 4 ms @ 48 kHz
+                        ramp = np.linspace(1.0, 0.0, nfade) ** 2
+                        pcm[:nfade] = np.rint(pcm[:nfade] * ramp)
+                        pcm[nfade:] = 0
+                elif self._sq_was_muted:
+                    pcm = pcm.copy()
+                    nfade = min(192, len(pcm))
+                    ramp = np.linspace(0.0, 1.0, nfade) ** 2
+                    pcm[:nfade] = np.rint(pcm[:nfade] * ramp)
+                self._sq_was_muted = bool(muted)
 
                 for q in list(self._subs.values()):
                     q.append(pcm)
