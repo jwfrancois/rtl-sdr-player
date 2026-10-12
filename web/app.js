@@ -31,6 +31,7 @@ const S = {
   stationsJson: "",         // change detection against /api/status
   sweepResults: [],         // last all-band sweep (strongest first)
   sweepFetchT: 0,           // throttle for results polling while sweeping
+  agentTouched: 0,          // ts: don't fight the user editing agent UI
 };
 
 const $ = (id) => document.getElementById(id);
@@ -198,6 +199,9 @@ function applyStatus(st) {
     S.stations = st.stations || [];
     renderStations();
   }
+
+  // v1.5: agent scheduler + LLM state
+  if (st.agent) applyAgentStatus(st.agent);
 }
 
 async function pollStatus() {
@@ -412,6 +416,163 @@ function wireControls() {
     if (e.key === "Enter") bmkSave();
     if (e.key === "Escape") $("bmk-add-row").hidden = true;
   });
+
+  // ---- v1.5 agent: commands, report, AI naming, schedule, LLM settings ----
+  $("ag-send").onclick = agentSend;
+  $("ag-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") agentSend();
+  });
+  $("ag-report").onclick = async () => {
+    agentChatLine("you", "report");
+    const btn = $("ag-report");
+    btn.disabled = true;
+    try {
+      const d = await (await fetch("/api/agent/report")).json();
+      agentChatLine("agent", d.text || d.error || "no data");
+    } catch (e) {
+      agentChatLine("agent", "report failed: " + e);
+    }
+    btn.disabled = false;
+  };
+  $("ag-name").onclick = agentEnrich;
+  for (const [id, key] of [["ag-interval", "sweep_interval_min"],
+                           ["ag-autofill", "sweep_auto_fill"],
+                           ["ag-listen", "sweep_allow_listeners"]]) {
+    $(id).addEventListener("change", () => {
+      const patch = {};
+      if (id === "ag-interval") {
+        patch[key] = parseInt($("ag-interval").value, 10) || 0;
+      } else {
+        patch[key] = $(id).checked;
+        if (key === "sweep_auto_fill" && !patch[key] &&
+            !confirm("Scheduled sweeps will no longer refill the 20 presets. Keep?")) {
+          $(id).checked = true;
+          return;
+        }
+      }
+      agentConfigSave(patch);
+    });
+  }
+  $("ag-llm-save").onclick = () => {
+    const patch = {
+      llm_enabled: $("ag-llm-on").checked,
+      llm_base_url: $("ag-llm-url").value.trim(),
+      llm_model: $("ag-llm-model").value.trim(),
+    };
+    if ($("ag-llm-key").value.trim()) {
+      patch.llm_api_key = $("ag-llm-key").value.trim();
+    }
+    agentConfigSave(patch, () => { $("ag-llm-key").value = ""; });
+  };
+}
+
+// -------------------------------------------------------------- agent (v1.5)
+function fmtDur(s) {
+  if (s == null) return "—";
+  s = Math.max(0, Math.round(s));
+  if (s < 90) return s + "s";
+  const m = Math.round(s / 60);
+  if (m < 90) return m + " min";
+  return (m / 60).toFixed(1) + " h";
+}
+
+function applyAgentStatus(ag, force) {
+  if (!force && Date.now() - S.agentTouched < 8000) return;  // user editing
+  $("ag-interval").value = String(ag.schedule.interval_min || 0);
+  $("ag-autofill").checked = !!ag.schedule.auto_fill;
+  $("ag-listen").checked = !!ag.schedule.allow_listeners;
+  $("ag-llm-on").checked = !!ag.llm.enabled;
+  if (ag.llm.base_url && !$("ag-llm-url").value) {
+    $("ag-llm-url").value = ag.llm.base_url;
+  }
+  if (ag.llm.model && !$("ag-llm-model").value) {
+    $("ag-llm-model").value = ag.llm.model;
+  }
+  const sch = ag.schedule;
+  let txt;
+  if (sch.sweeping) {
+    txt = "background sweep running…";
+  } else if (!sch.enabled) {
+    txt = "scheduled re-sweep off";
+  } else {
+    txt = "next re-sweep in " + fmtDur(sch.next_run_in_s);
+  }
+  if (sch.last_note && sch.last_note !== "never ran") {
+    txt += " · " + sch.last_note;
+  }
+  $("ag-status").textContent = txt;
+}
+
+function agentChatLine(who, text) {
+  const el = $("ag-chat");
+  el.hidden = false;
+  const div = document.createElement("div");
+  div.className = "ag-line ag-" + (who === "you" ? "q" : "a");
+  const b = document.createElement("span");
+  b.className = "ag-who";
+  b.textContent = who === "you" ? "you" : "agent";
+  const body = document.createElement("span");
+  body.textContent = text;
+  div.appendChild(b);
+  div.appendChild(body);
+  el.appendChild(div);
+  while (el.children.length > 10) el.removeChild(el.firstChild);
+  el.scrollTop = el.scrollHeight;
+}
+
+async function agentSend() {
+  const inp = $("ag-input");
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = "";
+  agentChatLine("you", text);
+  const d = await postJson("/api/agent/command", { text });
+  if (d) {
+    agentChatLine("agent", d.reply || d.error || "(no reply)");
+    if (d.action && d.action !== "unknown") refreshStatus();
+  } else {
+    agentChatLine("agent", "server unreachable");
+  }
+}
+
+async function agentEnrich() {
+  const btn = $("ag-name");
+  btn.disabled = true; btn.textContent = "AI…";
+  agentChatLine("you", "name the stations");
+  const d = await postJson("/api/agent/enrich", {});
+  if (d) {
+    agentChatLine("agent", d.ok
+      ? `AI named ${d.updated} preset${d.updated === 1 ? "" : "s"}.`
+        + (d.note ? " " + d.note : "")
+      : (d.error || "AI naming unavailable."));
+    if (d.ok) refreshStatus();
+  } else {
+    agentChatLine("agent", "server unreachable");
+  }
+  btn.disabled = false; btn.textContent = "AI names";
+}
+
+async function agentConfigSave(patch, after) {
+  S.agentTouched = Date.now();
+  const d = await postJson("/api/agent/config", patch);
+  if (d && d.ok) {
+    applyAgentStatus(d.agent, true);
+    if (after) after();
+  } else {
+    $("stat-note").textContent = "⚠ " + ((d && d.error) || "agent config failed");
+  }
+}
+
+async function postJson(path, body) {
+  try {
+    const res = await fetch(path, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    return await res.json();
+  } catch {
+    return null;
+  }
 }
 
 function switchBand(band) {
@@ -869,11 +1030,18 @@ function renderStations() {
   for (let i = 0; i < 20; i++) {
     const st = (S.stations || [])[i];
     if (st) {
-      html += '<button class="st-slot st-' + st.band + '" data-slot="' +
-        (i + 1) + '" title="' + escapeHtml(st.name) +
-        ' \u00b7 click: tune \u00b7 right-click: overwrite \u00b7 double-click: rename">' +
+      const shown = st.ai_name || st.name;
+      const ai = st.ai_name ? '<span class="st-ai" title="AI-suggested name">\u2726</span>' : "";
+      const lock = st.locked ? " locked" : "";
+      const tip = st.name +
+        (st.ai_name ? " \u00b7 AI: " + st.ai_name +
+          (st.genre ? " (" + st.genre + ")" : "") : "") +
+        " \u00b7 click: tune \u00b7 right-click: overwrite \u00b7 double-click: rename" +
+        (st.locked ? " \u00b7 auto-fill keeps this name" : "");
+      html += '<button class="st-slot st-' + st.band + lock + '" data-slot="' +
+        (i + 1) + '" title="' + escapeHtml(tip) + '">' +
         '<span class="st-num">' + (i + 1) + "</span>" +
-        '<span class="st-name">' + escapeHtml(st.name) + "</span>" +
+        '<span class="st-name">' + escapeHtml(shown) + ai + "</span>" +
         '<span class="st-freq">' + stationFreqText(st) + "</span></button>";
     } else {
       html += '<button class="st-slot empty" data-slot="' + (i + 1) +

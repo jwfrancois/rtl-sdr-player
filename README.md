@@ -15,6 +15,8 @@ Dongle → [this app] → http://localhost:8515
              ├── AIR tab                 US airband 118–137 MHz: AM + USB/LSB,
              │                           squelch scanner + station memory
              ├── Live spectrum + waterfall with click-to-tune
+             ├── Agent (v1.5)            scheduled background re-sweeps, natural-language
+             │                           control, LLM station naming, dial report
              └── TV tab                  DVB-T capability detection + guide
                                          (Linux: full channel scan & playback)
 ```
@@ -92,6 +94,39 @@ macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 (radio works; TV does not).
 
 ---
+
+## What's new in v1.5.0
+
+**The agent: your receiver runs itself.**
+
+- **Scheduled background re-sweeps** — pick *15 min / 30 min / 1 h / 4 h* in the
+  AGENT panel (or just tell the app "sweep every 30 minutes") and the receiver
+  re-sweeps all bands by itself, **auto-refills the 20 presets** and leaves a
+  note ("sweep done: auto-filled 18 presets"). Slots you named by hand
+  (double-click rename, shown with an amber right edge) are **kept** — the
+  scheduler refills around them and never double-books their channel. By
+  default a scheduled sweep waits until no browser tab is listening; tick
+  **while listening** to let it interrupt (audio mutes during the sweep, your
+  station comes back after).
+- **Natural-language control** — the AGENT panel has a command box:
+  `tune 101.7` · `am 1010` · `121.5` · `162.550` · `scan airband` ·
+  `scan noaa` · `sweep all` · `sweep fm wx` · `rescan` · `stop` ·
+  `next station` · `previous station` · `report` · `what am i listening to` ·
+  `sweep every 30 minutes` · `sweeps off` · `help`. Rule-based, instant, and
+  it works without any LLM.
+- **Dial report** — **Report** answers "what's on air?": what you're tuned to,
+  what the last sweep found (strongest stations with names), how many presets
+  are filled, and what to do next.
+- **LLM station naming (optional)** — configure any OpenAI-compatible endpoint
+  (OpenAI, Z.ai GLM, local Ollama / LM Studio, vLLM) under *AGENT → LLM
+  settings* and press **AI names**: the model proposes display names + genre
+  tags for your presets (marked ✦ on the slot; your original name stays
+  untouched underneath, and the tooltip shows both). The key stays in
+  `agent_config.json` on this machine. When enabled, the agent also
+  understands fuzzier commands and adds a narrative to the dial report, and
+  scheduled sweeps can auto-name new stations (`auto_enrich`).
+- PI codes from RDS are stored with presets and shown to the LLM as hints
+  (unambiguous US callsign candidates are decoded from the NRSC-4 table).
 
 ## What's new in v1.4.0
 
@@ -292,9 +327,18 @@ squelch doesn't chatter on marginal carriers.
   type a frequency and press Enter. FM shows MHz, AM shows kHz.
 - **Presets**: WX and AIR tabs show clickable channel chips (WX1–WX7, Guard,
   CTAF…). The active one is highlighted.
+- **Agent (AGENT panel)**: a command box that controls the receiver in plain
+  English (see v1.5 above), a **Report** button (what's on air), and an
+  **AI names** button. RE-SWEEP schedules the background all-band sweep:
+  *off / 15 min / 30 min / 1 h / 4 h*, with **fill** (auto-refill the 20
+  presets afterwards) and **while listening** (allow sweeps while a tab is
+  open) toggles. The status line under it counts down to the next sweep and
+  reports the last one's outcome. *LLM settings* stores an OpenAI-compatible
+  base URL + model + API key for AI naming and fuzzy commands.
 - **Stations (20 presets)**: your own bank of named stations. Click a slot
   to tune, **right-click** to save the current station into it (named
-  automatically from RDS / the WX table), **double-click** to rename.
+  automatically from RDS / the WX table), **double-click** to rename —
+  renamed slots are locked (amber right edge) and survive re-fills.
   See the sweep below for the one-click way to fill all 20.
 - **Sweep (SCANNER panel, every band)**: tick the bands you want
   (FM / AM / WX / AIR) and press **All bands**. The receiver visits every
@@ -421,10 +465,12 @@ backend/config.py    defaults + band/preset/mode/scan tables
 backend/device.py    RTL-SDR driver layer + synthetic simulator (RDS + SSB test signals)
 backend/dsp.py       FM/AM/NBFM/SSB demodulation, CTCSS decoder, pilot tracker, decimation, PSD
 backend/rds.py       RDS decoder (Costas+Gardner+CRC) + test-signal encoder
-backend/stream.py    capture thread, tuning, squelch + CTCSS gate, scanner + memory, bookmarks, streaming
+backend/agent.py     agent layer: NL commands, dial report, LLM naming client
+backend/stream.py    capture thread, tuning, squelch + CTCSS gate, scanner + memory, bookmarks, streaming, sweep scheduler
 backend/tv.py        DVB-T detection, channel scan, TS streaming (Linux)
 web/                 browser UI (spectrum + waterfall zoom, RDS, scanner, CTCSS, bookmarks)
 config.json          user settings
+agent_config.json    agent settings (created on first change; sweep schedule + LLM key, local only)
 setup.bat / run.bat  Windows helpers
 run.sh               Linux/macOS launcher
 tests/               self-test suite (codec, DSP chain, engine, REST/WS smoke)

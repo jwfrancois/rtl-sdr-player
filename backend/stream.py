@@ -26,6 +26,7 @@ from collections import deque
 
 import numpy as np
 
+from . import agent as agent_mod
 from . import config as cfg
 from . import device as devmod
 from . import dsp
@@ -106,6 +107,18 @@ class ReceiverEngine:
                                         conf.get("sweep_results_file",
                                                  "sweep_results.json"))
         self.sweep_results = self._load_sweep_results()
+        self.sweep_meta = {"t": None, "bands": None}
+
+        # v1.5: agent layer — scheduled background re-sweeps, LLM naming,
+        # natural-language commands. Settings persist to agent_config.json.
+        self._agent_path = os.path.join(cfg.ROOT,
+                                        conf.get("agent_config_file",
+                                                 "agent_config.json"))
+        self.agent = self._load_agent_config()
+        self._sched = {"next_t": None, "last_run": None,
+                       "last_note": "never ran", "sweeping": False}
+        self._sched_stop = threading.Event()
+        self._sched_thread = None
 
         # scanner state
         #   mode "live"  - hop/hold on squelch activity (v1.1 behaviour)
@@ -121,7 +134,7 @@ class ReceiverEngine:
             # sweep-only fields
             "bands": [], "threshold_db": None, "dwell": 0.35,
             "rds_wait": 1.6, "cur_db": None, "rds_name": None,
-            "restore": None, "t0": None,
+            "rds_pi": None, "restore": None, "t0": None,
         }
 
     # ------------------------------------------------------------------
@@ -140,16 +153,25 @@ class ReceiverEngine:
                                         name="sdr-usb")
         self._thread.start()
         self._reader.start()
+        # v1.5: background re-sweep scheduler (no-op while disabled)
+        self._sched_stop.clear()
+        self._sched_thread = threading.Thread(target=self._scheduler_loop,
+                                              daemon=True,
+                                              name="agent-scheduler")
+        self._sched_thread.start()
         self.started = True
 
     def close(self):
         self._stop.set()
+        self._sched_stop.set()
         self._pause_req.clear()
         self._resume.set()          # unblock a parked reader
         if self._thread:
             self._thread.join(timeout=2.0)
         if self._reader:
             self._reader.join(timeout=2.0)
+        if self._sched_thread:
+            self._sched_thread.join(timeout=2.0)
         if self.device:
             self.device.close()
 
@@ -317,6 +339,7 @@ class ReceiverEngine:
             "hop_t": time.monotonic(), "hop_gen": self.gen + 1,
             "freqs": [f for _, f in chans], "chans": list(chans),
             "order": order, "cur_db": None, "rds_name": None,
+            "rds_pi": None,
         })
         band0, freq0 = chans[0]
         self._pending = ("tune", band0, freq0)
@@ -535,17 +558,24 @@ class ReceiverEngine:
                     name = self._live_station_name()
                 # 2) a sweep that already identified this channel keeps
                 #    its name (right-click save after a sweep)
+                pi = None
                 if not name:
                     for r in self.sweep_results or []:
                         if (r.get("band") == band
-                                and r.get("freq_hz") == freq_hz
-                                and r.get("name")):
-                            name = r["name"]
+                                and r.get("freq_hz") == freq_hz):
+                            if r.get("name"):
+                                name = r["name"]
+                            pi = r.get("pi")
                             break
                 name = name or self._default_station_name(band, freq_hz)
+            else:
+                pi = None
             st = {"slot": slot, "name": str(name).strip()[:32] or "?",
                   "band": band, "freq_hz": freq_hz, "mode": mode,
-                  "added": round(time.time(), 1)}
+                  "added": round(time.time(), 1),
+                  # user-typed name -> auto-fill must keep this slot
+                  "locked": bool(name),
+                  "pi": pi}
             self.stations[slot - 1] = st
             self._save_stations()
             return st
@@ -565,12 +595,15 @@ class ReceiverEngine:
             self._save_stations()
         return {"ok": True}
 
-    def fill_stations_from_sweep(self, count=None):
+    def fill_stations_from_sweep(self, count=None, keep_locked=True):
         """Populate the 20 slots from the last sweep results.
 
         Strongest stations first, one per channel (adjacent-channel
         shoulders are merged so one broadcast does not eat two slots).
-        Existing slot contents are overwritten.
+        With keep_locked=True, slots the user named by hand ("locked")
+        survive: they keep their name, and if their channel is still in
+        the sweep results that pick is consumed so the channel is not
+        double-booked into another slot.
         """
         results = [r for r in (self.sweep_results or [])
                    if r.get("db") is not None]
@@ -578,23 +611,47 @@ class ReceiverEngine:
             raise ValueError("no sweep results yet — run a sweep first")
         count = int(count or self.NUM_STATIONS)
         count = max(1, min(self.NUM_STATIONS, count))
-        picks = self._dedupe_results(results)[:count]
+        picks = self._dedupe_results(results)
         with self._lock:
-            self.stations = [None] * self.NUM_STATIONS
-            for i, r in enumerate(picks):
+            stations = [None] * self.NUM_STATIONS
+            used = set()
+            if keep_locked:
+                for i, cur in enumerate(self.stations):
+                    if not (cur and cur.get("locked")):
+                        continue
+                    stations[i] = dict(cur)
+                    match = next(
+                        (j for j, r in enumerate(picks)
+                         if j not in used and r.get("band") == cur["band"]
+                         and abs(r["freq_hz"] - cur["freq_hz"]) < 500), None)
+                    if match is not None:
+                        used.add(match)
+            placed = []
+            free_slots = iter(i for i in range(self.NUM_STATIONS)
+                              if stations[i] is None)
+            for j, r in enumerate(picks):
+                if j in used or len(placed) >= count:
+                    continue
+                i = next(free_slots, None)
+                if i is None:
+                    break
                 band = r["band"]
-                self.stations[i] = {
+                stations[i] = {
                     "slot": i + 1,
-                    "name": (r.get("name")
-                             or self._default_station_name(band,
-                                                           r["freq_hz"]))[:32],
+                    "name": (r.get("name") or
+                             self._default_station_name(band,
+                                                        r["freq_hz"]))[:32],
                     "band": band,
                     "freq_hz": int(r["freq_hz"]),
                     "mode": r.get("mode"),
                     "added": round(time.time(), 1),
+                    "locked": False,
+                    "pi": r.get("pi"),
                 }
+                placed.append(r)
+            self.stations = stations
             self._save_stations()
-        return picks
+        return placed
 
     @staticmethod
     def _dedupe_results(results):
@@ -625,6 +682,8 @@ class ReceiverEngine:
                 data = json.load(fh)
             if isinstance(data, dict) and isinstance(data.get("results"),
                                                      list):
+                self.sweep_meta = {"t": data.get("t"),
+                                   "bands": data.get("bands")}
                 return data["results"]
         except (OSError, ValueError):
             pass
@@ -661,6 +720,213 @@ class ReceiverEngine:
         if snap and snap.get("ps"):
             return str(snap["ps"]).strip()[:32]
         return None
+
+    # ------------------------------------------------------------------
+    # v1.5 agent layer: scheduled re-sweeps, LLM naming, settings
+    # ------------------------------------------------------------------
+    def _load_agent_config(self):
+        merged = dict(agent_mod.AGENT_DEFAULTS)
+        try:
+            with open(self._agent_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                for k in merged:
+                    if k in data:
+                        merged[k] = data[k]
+        except (OSError, ValueError):
+            pass
+        return merged
+
+    def _save_agent_config(self):
+        try:
+            tmp = self._agent_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.agent, fh, indent=1)
+            os.replace(tmp, self._agent_path)
+        except OSError:
+            pass  # agent settings are a convenience; never break the loop
+
+    def agent_status(self):
+        with self._lock:
+            a = dict(self.agent)
+            sched = dict(self._sched)
+        interval = float(a.get("sweep_interval_min") or 0)
+        now = time.time()
+        key = str(a.get("llm_api_key") or "")
+        return {
+            "schedule": {
+                "enabled": interval > 0,
+                "interval_min": interval,
+                "next_run_in_s": (max(0, round(sched["next_t"] - now))
+                                  if interval > 0 and sched.get("next_t")
+                                  else None),
+                "last_run": sched.get("last_run"),
+                "last_note": sched.get("last_note"),
+                "sweeping": bool(sched.get("sweeping")),
+                "auto_fill": bool(a.get("sweep_auto_fill")),
+                "allow_listeners": bool(a.get("sweep_allow_listeners")),
+                "bands": a.get("sweep_bands"),
+            },
+            "llm": {
+                "enabled": bool(a.get("llm_enabled")),
+                "configured": bool(a.get("llm_base_url") and key),
+                "model": a.get("llm_model") or "",
+                "base_url": a.get("llm_base_url") or "",
+                "key_hint": ("..." + key[-4:]) if key else "",
+            },
+        }
+
+    def set_agent_settings(self, patch):
+        """Validate + persist an agent-settings patch; returns new status."""
+        a = dict(self.agent)
+        if "sweep_interval_min" in patch:
+            v = float(patch["sweep_interval_min"] or 0)
+            if v and v < 5:
+                raise ValueError(
+                    "re-sweep interval must be >= 5 minutes (or 0 = off)")
+            a["sweep_interval_min"] = v
+        if "sweep_bands" in patch:
+            b = patch["sweep_bands"]
+            if b is not None:
+                unknown = [x for x in b if x not in cfg.BANDS]
+                if unknown:
+                    raise ValueError(f"unknown sweep bands: {unknown}")
+                b = list(b)
+            a["sweep_bands"] = b
+        for k in ("sweep_auto_fill", "sweep_allow_listeners",
+                  "auto_enrich", "llm_enabled"):
+            if k in patch:
+                a[k] = bool(patch[k])
+        for k in ("llm_base_url", "llm_model"):
+            if k in patch:
+                a[k] = str(patch[k] or "").strip()
+        if patch.get("llm_api_key") is not None:
+            a["llm_api_key"] = str(patch["llm_api_key"]).strip()
+        with self._lock:
+            self.agent = a
+            self._save_agent_config()
+            interval = float(a.get("sweep_interval_min") or 0)
+            if interval <= 0:
+                self._sched["next_t"] = None
+            else:
+                self._sched["next_t"] = time.time() + interval * 60
+        return self.agent_status()
+
+    def _scheduler_loop(self):
+        while not self._sched_stop.wait(timeout=5.0):
+            try:
+                self._scheduler_tick(time.time())
+            except Exception as exc:      # never let the agent die silently
+                try:
+                    with self._lock:
+                        self._sched["last_note"] = \
+                            f"scheduler error: {exc}"
+                except Exception:
+                    pass
+
+    def _scheduler_tick(self, now):
+        with self._lock:
+            a = dict(self.agent)
+            interval = float(a.get("sweep_interval_min") or 0)
+            scan_running = self._scan["running"]
+            sched = self._sched
+        if interval <= 0:
+            sched["next_t"] = None
+            return
+        if sched.get("sweeping"):
+            # a scheduled sweep is in flight: watch for completion
+            if not scan_running:
+                sched["sweeping"] = False
+                self._after_scheduled_sweep(now)
+            return
+        if scan_running:
+            return          # user-driven scan/sweep: try again next tick
+        if sched.get("next_t") is None:
+            sched["next_t"] = (sched.get("last_run") or now) \
+                + interval * 60
+            return
+        if now < sched["next_t"]:
+            return
+        if not a.get("sweep_allow_listeners") and self._sub_count() > 0:
+            with self._lock:
+                sched["last_note"] = "deferred — a browser tab is listening"
+                sched["next_t"] = now + 60
+            return
+        try:
+            res = self.start_sweep(bands=a.get("sweep_bands"))
+            with self._lock:
+                sched["sweeping"] = True
+                sched["last_run"] = now
+                sched["last_note"] = ("scheduled sweep started ("
+                                      + str(res["channels"]) + " channels)")
+        except Exception as exc:
+            with self._lock:
+                sched["last_note"] = f"scheduled sweep failed: {exc}"
+                sched["next_t"] = now + 300
+
+    def _sub_count(self):
+        with self._lock:
+            return len(self._subs)
+
+    def _after_scheduled_sweep(self, now):
+        """Post-sweep hook of the scheduler: auto-fill presets and, when
+        configured, let the LLM name the unnamed ones (runs on the
+        scheduler thread - never on the capture loop)."""
+        with self._lock:
+            a = dict(self.agent)
+            sched = self._sched
+        interval = float(a.get("sweep_interval_min") or 0)
+        if interval > 0:
+            sched["next_t"] = now + interval * 60
+        notes = []
+        if a.get("sweep_auto_fill") and (self.sweep_results or []):
+            try:
+                placed = self.fill_stations_from_sweep(keep_locked=True)
+                notes.append(f"auto-filled {len(placed)} presets")
+            except Exception as exc:
+                notes.append(f"auto-fill failed: {exc}")
+        if (a.get("auto_enrich") and a.get("llm_enabled")
+                and a.get("llm_base_url") and a.get("llm_api_key")):
+            try:
+                res = self.enrich_station_names(a)
+                if res.get("ok") and res.get("updated"):
+                    notes.append(f"AI named {res['updated']} presets")
+            except Exception as exc:
+                notes.append(f"AI naming failed: {exc}")
+        with self._lock:
+            sched["last_note"] = "sweep done: " + \
+                (", ".join(notes) if notes else
+                f"{len(self.sweep_results or [])} stations")
+
+    def enrich_station_names(self, acfg=None):
+        """LLM naming for the 20 presets (Agent > 'AI names').
+        Updates ai_name/genre per slot; the plain name stays untouched so
+        a bad suggestion is always one rename away from reverted."""
+        a = acfg or self.agent
+        if not a.get("llm_enabled"):
+            return {"ok": False, "error":
+                    "LLM naming is off — open Agent > LLM settings, "
+                    "enter an OpenAI-compatible base URL + API key and "
+                    "enable it."}
+        if not (a.get("llm_base_url") and a.get("llm_api_key")):
+            return {"ok": False, "error":
+                    "LLM not configured — set base URL and API key in "
+                    "Agent > LLM settings."}
+        with self._lock:
+            stations = [dict(s) if s else None
+                        for s in self.stations]
+        updated = agent_mod.enrich_stations(stations, a)
+        if not updated:
+            return {"ok": True, "updated": 0, "note": "nothing to name"}
+        with self._lock:
+            for u in updated:
+                i = int(u["slot"]) - 1
+                if 0 <= i < self.NUM_STATIONS and self.stations[i]:
+                    self.stations[i]["ai_name"] = u["name"]
+                    if u.get("genre"):
+                        self.stations[i]["genre"] = u["genre"]
+            self._save_stations()
+        return {"ok": True, "updated": len(updated)}
 
     def subscribe(self):
         """Register an audio consumer. Each gets its own bounded queue so
@@ -756,6 +1022,7 @@ class ReceiverEngine:
                 "scan": self.scan_status(),
                 "bookmarks": self.bookmarks_list(),
                 "stations": self.stations_list(),
+                "agent": self.agent_status(),
                 "target_buffer_ms": int(self.conf["audio_target_buffer_s"] * 1000),
                 "started": self.started,
                 "capture": {
@@ -847,6 +1114,7 @@ class ReceiverEngine:
         sc["hop_gen"] = self.gen + 1
         sc["cur_db"] = None
         sc["rds_name"] = None
+        sc["rds_pi"] = None
         self._pending = ("tune", band, freq)
 
     def _run_scanner(self, now, sq_open):
@@ -904,6 +1172,7 @@ class ReceiverEngine:
             snap = self.current_rds()
             if snap and snap.get("ps"):
                 sc["rds_name"] = str(snap["ps"]).strip()[:32] or None
+                sc["rds_pi"] = snap.get("pi")
         elapsed = now - sc["hop_t"]
         # hold a little longer on a hot FM channel so the PS name arrives,
         # but only when a stereo pilot is present (no pilot = no RDS at all)
@@ -928,6 +1197,8 @@ class ReceiverEngine:
             "name": sc.get("rds_name") or self._default_station_name(band, freq),
             "mode": None,
         }
+        if sc.get("rds_pi"):
+            rec["pi"] = sc["rds_pi"]
         results = sc.setdefault("results", [])
         results.append(rec)
         self._record_hit(freq)
@@ -940,7 +1211,8 @@ class ReceiverEngine:
         results = sc.get("results") or []
         if results:
             self.sweep_results = results
-            self._save_sweep_results({"t": sc.get("t0") or time.time(),
+            self.sweep_meta = {"t": time.time(), "bands": sc.get("bands")}
+            self._save_sweep_results({"t": self.sweep_meta["t"],
                                       "bands": sc.get("bands")})
         if restore:
             self._pending = ("tune", restore[0], restore[1])

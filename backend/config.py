@@ -7,7 +7,7 @@ import json
 import os
 
 APP_NAME = "RTL-SDR Player"
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -30,11 +30,12 @@ DEFAULTS = {
     "scan_dwell_s": 0.45,          # time spent per channel while scanning
     "scan_release_s": 2.5,         # squelch-closed time before hopping on
     "sweep_dwell_s": 0.35,         # time spent per channel in the all-band sweep
-    "sweep_rds_wait_s": 3.0,       # extra dwell on hot FM channels for RDS PS
+    "sweep_rds_wait_s": 4.5,       # extra dwell on hot FM channels for RDS PS
     "scan_memory_file": "scan_memory.json",
     "bookmarks_file": "bookmarks.json",
     "stations_file": "stations.json",       # the 20 named station presets
     "sweep_results_file": "sweep_results.json",
+    "agent_config_file": "agent_config.json",  # v1.5 agent/scheduler/LLM
 }
 
 # Standard EIA CTCSS (PL) tones in Hz — the sub-audible squelch tones used

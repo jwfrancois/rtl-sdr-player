@@ -417,6 +417,63 @@ async def main():
     r = rest("/api/sweep/stop", {})
     check("sweep stop when idle ok", r.get("ok") is True)
 
+    # ---- 11. agent: config, commands, report, schedule (v1.5) ----
+    # deterministic start: scheduler off, no LLM (leftovers from earlier
+    # manual sessions must not flip these checks)
+    rest("/api/agent/config", {"sweep_interval_min": 0,
+                               "sweep_auto_fill": True,
+                               "sweep_allow_listeners": False,
+                               "llm_enabled": False})
+    r = rest("/api/agent/config")
+    ag0 = r.get("agent") or {}
+    check("agent config exposed",
+          "schedule" in ag0 and "llm" in ag0
+          and ag0["schedule"].get("interval_min") == 0,
+          json.dumps(ag0.get("schedule", {}))[:80])
+    r = rest("/api/agent/command", {"text": "status"})
+    check("agent command status", r.get("ok") is True
+          and "presets" in r.get("reply", ""), r.get("reply", "")[:60])
+    r = rest("/api/agent/command", {"text": "tune to 101.7"})
+    check("agent command tune", r.get("ok") is True
+          and r.get("action") == "tune", r.get("reply", "")[:60])
+    await asyncio.sleep(0.6)
+    st = rest("/api/status")
+    check("agent tune applied on engine", st["band"] == "wfm"
+          and abs(st["freq_hz"] - 101_700_000) < 500,
+          f"{st['band']} {st['freq_hz']}")
+    r = rest("/api/agent/command", {"text": "sweep every 15 minutes"})
+    check("agent schedule via command",
+          r.get("ok") is True and "15" in r.get("reply", ""),
+          r.get("reply", "")[:60])
+    st = rest("/api/status")
+    check("schedule visible in status",
+          st["agent"]["schedule"]["interval_min"] == 15
+          and st["agent"]["schedule"]["enabled"] is True
+          and st["agent"]["schedule"]["next_run_in_s"] is not None)
+    r = rest("/api/agent/config", {"sweep_interval_min": 0})
+    check("schedule off again", r["agent"]["schedule"]["enabled"] is False)
+    r = rest("/api/agent/command", {"text": "report"})
+    check("agent report via command", r.get("ok") is True
+          and "DIAL REPORT" in r.get("reply", ""), r.get("reply", "")[:60])
+    r = json.loads(urllib.request.urlopen(BASE + "/api/agent/report",
+                                          timeout=5).read())
+    check("report endpoint", r.get("ok") is True
+          and bool(r.get("text")) and r.get("ai") is False)
+    r = rest("/api/agent/command", {"text": "rescan"})
+    check("rescan alias starts sweep", r.get("ok") is True
+          and r.get("action") == "sweep", r.get("reply", "")[:60])
+    rest("/api/sweep/stop", {})
+    r = rest("/api/agent/command", {"text": "help"})
+    check("agent help", r.get("ok") is True and "sweep" in r.get("reply", ""))
+    r = rest("/api/agent/command", {"text": "gibberish xyzzy"})
+    check("unknown command stays friendly", r.get("ok") is False
+          and "catch" in r.get("reply", ""), r.get("reply", "")[:50])
+    r = rest("/api/agent/enrich", {})
+    check("enrich without LLM answers clearly", r.get("ok") is False
+          and "LLM" in r.get("error", ""), r.get("error", "")[:60])
+    # restore pre-sweep-ish tuning for later/next runs
+    rest("/api/tune", {"band": "wfm", "freq_hz": 98_300_000})
+
     print()
     if fails:
         print("SMOKE TEST FAILURES:", fails)

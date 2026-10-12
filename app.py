@@ -262,13 +262,72 @@ async def api_stations_clear():
 @app.post("/api/stations/fill")
 async def api_stations_fill(body: dict):
     """Fill the 20 slots from the last sweep (strongest first,
-    adjacent-channel shoulders merged)."""
+    adjacent-channel shoulders merged). Slots the user named by hand
+    survive with their own name."""
     try:
         picks = engine.fill_stations_from_sweep(count=body.get("count"))
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     return {"ok": True, "filled": len(picks),
             "stations": engine.stations_list()}
+
+
+# ----------------------------------------------------------------------
+# v1.5: agent — LLM naming, dial report, natural-language commands,
+#       scheduled background re-sweeps
+# ----------------------------------------------------------------------
+@app.get("/api/agent/config")
+async def api_agent_config():
+    return {"ok": True, "agent": engine.agent_status()}
+
+
+@app.post("/api/agent/config")
+async def api_agent_config_set(body: dict):
+    try:
+        st = engine.set_agent_settings(body or {})
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    return {"ok": True, "agent": st}
+
+
+@app.post("/api/agent/command")
+async def api_agent_command(body: dict):
+    """Natural-language control: "tune 101.7", "sweep all", "report",
+    "sweep every 30 minutes", ... Rule-based, optional LLM fallback."""
+    text = (body.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"ok": False, "error": "text required"},
+                            status_code=400)
+    from backend import agent as agent_mod
+    try:
+        return await asyncio.to_thread(
+            agent_mod.execute_command, engine, text, dict(engine.agent))
+    except Exception as exc:
+        return {"ok": False, "action": "error",
+                "reply": f"agent error: {exc}"}
+
+
+@app.get("/api/agent/report")
+async def api_agent_report():
+    """What's on air? Template report always; LLM narrative if enabled."""
+    from backend import agent as agent_mod
+    try:
+        return await asyncio.to_thread(
+            agent_mod.dial_report, engine, dict(engine.agent))
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@app.post("/api/agent/enrich")
+async def api_agent_enrich():
+    """Let the configured LLM propose friendly names for the presets."""
+    try:
+        return await asyncio.to_thread(engine.enrich_station_names)
+    except Exception as exc:
+        from backend.agent import AgentError
+        msg = str(exc) if isinstance(exc, AgentError) \
+            else "AI naming failed: " + str(exc)
+        return {"ok": False, "error": msg}
 
 
 @app.get("/api/tv/status")

@@ -93,6 +93,53 @@
         <div class="bmk-list" id="bmk-list"></div>
       </div>
 
+      <div class="agent" id="agent-panel">
+        <div class="mem-head">
+          <span class="lbl">AGENT</span>
+          <span class="st-actions">
+            <button id="ag-report" class="btn btn-mini"
+                    title="What's on air? A summary of what the receiver can hear right now">Report</button>
+            <button id="ag-name" class="btn btn-mini"
+                    title="Let the configured LLM propose friendly station names for the presets">AI names</button>
+          </span>
+        </div>
+        <div class="ag-chat" id="ag-chat" hidden></div>
+        <div class="ag-row">
+          <input id="ag-input" placeholder='try: "tune 101.7" &middot; "sweep all" &middot; "report"'
+                 spellcheck="false" autocomplete="off">
+          <button id="ag-send" class="btn btn-mini btn-accent">Ask</button>
+        </div>
+        <div class="ag-sched">
+          <span class="lbl">RE-SWEEP</span>
+          <select id="ag-interval" title="Automatic background re-sweep of all bands">
+            <option value="0">off</option>
+            <option value="15">15 min</option>
+            <option value="30">30 min</option>
+            <option value="60">1 h</option>
+            <option value="240">4 h</option>
+          </select>
+          <label class="ag-cb" title="After each scheduled sweep, refill the 20 presets (slots you named yourself are kept)">
+            <input type="checkbox" id="ag-autofill" checked>fill</label>
+          <label class="ag-cb" title="Run the scheduled sweep even while a browser tab is connected (audio mutes briefly, then returns)">
+            <input type="checkbox" id="ag-listen">while listening</label>
+        </div>
+        <div class="ag-status" id="ag-status">scheduled re-sweep off</div>
+        <details class="ag-adv">
+          <summary>LLM settings (optional)</summary>
+          <div class="ag-adv-grid">
+            <label>Base URL
+              <input id="ag-llm-url" placeholder="https://api.openai.com/v1" spellcheck="false" autocomplete="off"></label>
+            <label>Model
+              <input id="ag-llm-model" placeholder="gpt-4o-mini" spellcheck="false" autocomplete="off"></label>
+            <label>API key
+              <input id="ag-llm-key" type="password" placeholder="sk-&hellip; (stored locally only)" autocomplete="off"></label>
+            <label class="ag-cb"><input type="checkbox" id="ag-llm-on">
+              Use the LLM for station names + fuzzy commands</label>
+            <button id="ag-llm-save" class="btn btn-mini">Save LLM settings</button>
+          </div>
+        </details>
+      </div>
+
       <div class="mode-row" id="mode-row" hidden></div>
 
       <div class="scan-row sq-row bfo-row" id="bfo-row" hidden>
