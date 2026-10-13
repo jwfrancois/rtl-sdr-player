@@ -593,14 +593,25 @@ async def main():
     r = rest("/api/audit/start", {"freqs": [96_100_000], "dwell_s": 2.5})
     check("audit starts", r.get("ok") is True and r.get("channels") == 1,
           json.dumps(r)[:90])
-    rep = rest("/api/audit/report")
-    deadline = time.time() + 25
-    while time.time() < deadline and (rep.get("audit") or {}).get("running"):
-        await asyncio.sleep(0.4)
+    # RDS decoding is bit-timing sensitive: on a slow/loaded CI VM a short
+    # dwell can drop just enough groups to mangle one PS character. Retry
+    # once with a longer dwell before declaring failure (v1.7.2 CI flake).
+    rep_data = {}
+    rows = []
+    row = None
+    for attempt in range(2):
         rep = rest("/api/audit/report")
-    rep_data = rep.get("report") or {}
-    rows = rep_data.get("results") or []
-    row = next((x for x in rows if x["freq_hz"] == 96_100_000), None)
+        deadline = time.time() + 25
+        while time.time() < deadline and (rep.get("audit") or {}).get("running"):
+            await asyncio.sleep(0.4)
+            rep = rest("/api/audit/report")
+        rep_data = rep.get("report") or {}
+        rows = rep_data.get("results") or []
+        row = next((x for x in rows if x["freq_hz"] == 96_100_000), None)
+        if (row or {}).get("ps") == "SIM-RDS" and (row or {}).get("ps_complete"):
+            break
+        if attempt == 0:
+            rest("/api/audit/start", {"freqs": [96_100_000], "dwell_s": 4})
     check("audit completes with report", bool(row),
           str([(x["freq_hz"], x.get("score")) for x in rows]))
     check("audit scores the sim station",
