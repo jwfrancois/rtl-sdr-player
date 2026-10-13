@@ -459,6 +459,104 @@ def main():
         else:
             sys.modules["pyrtlsdrlib"] = saved_mod10
 
+    # -- v1.7.11: the probe must be self-evidencing -------------------------
+    # petro printed "no system librtlsdr found" while ldconfig clearly listed
+    # a loadable .so.0 - a stale detector next to a fresh config.py. The
+    # probe must (a) query the linker cache itself, (b) record every
+    # verdict, (c) name the offending symbol in ABI rejections, and (d)
+    # carry a version constant the banner can pair against config.VERSION.
+    cachetext = "\n".join([
+        "604 libusb-1.0.so.0 (libc6,x86-64) => /lib/x86_64-linux-gnu/libusb-1.0.so.0",
+        "1234 librtlsdr.so.2 (libc6,x86-64) => /lib/x86_64-linux-gnu/librtlsdr.so.2",
+        "1235 librtlsdr.so.0 (libc6,x86-64) => /lib/x86_64-linux-gnu/librtlsdr.so.0",
+        "   \tlibusb-1.0.so.0 (libc6) => /lib/i386-linux-gnu/libusb-1.0.so.0",
+    ])
+    cc = devmod._ldconfig_candidates(cachetext)
+    check("ldconfig parser picks both generations in cache order",
+          cc == ["/lib/x86_64-linux-gnu/librtlsdr.so.2",
+                 "/lib/x86_64-linux-gnu/librtlsdr.so.0"], str(cc))
+    check("ldconfig parser ignores unrelated entries and blanks",
+          all("librtlsdr" in p for p in cc) and len(cc) == 2, str(cc))
+    check("ldconfig parser survives garbage input",
+          devmod._ldconfig_candidates("not a cache at all\n===") == [])
+    check("DEVICE_LAYER_VERSION declared",
+          str(getattr(devmod, "DEVICE_LAYER_VERSION", "")).count(".") == 2,
+          str(getattr(devmod, "DEVICE_LAYER_VERSION", "")))
+
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, "empty"), exist_ok=True)
+    hitc = devmod.find_system_librtlsdr(
+        search_dirs=[os.path.join(d, "empty")],
+        validate=lambda p: True,
+        ldconfig_text=cachetext)
+    check("linker-cache path becomes a candidate outside scan dirs",
+          hitc == "/lib/x86_64-linux-gnu/librtlsdr.so.2", str(hitc))
+    pv = dict(devmod._LAST_PROBE["verdicts"])
+    check("probe table records the linker-cache verdict",
+          pv.get(hitc) == "OK - selected", str(pv))
+
+    check("ABI reason for a missing file names CDLL",
+          "CDLL failed" in (devmod._abi_reject_reason(
+              os.path.join(d, "does-not-exist.so.0")) or ""))
+    textso = os.path.join(d, "librtlsdr-text.so.0")
+    open(textso, "w").close()
+    check("ABI reason for a text file names CDLL",
+          "CDLL failed" in (devmod._abi_reject_reason(textso) or ""))
+
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if gcc:
+        d2 = tempfile.mkdtemp()
+        src0 = os.path.join(d2, "g0.c")
+        src2 = os.path.join(d2, "g2.c")
+        with open(src0, "w") as f:
+            f.write("void *rtlsdr_open(int i){return 0;}\n"
+                    "int rtlsdr_read_sync(void*a,char*b,int c,int*d)"
+                    "{return 0;}\n"
+                    "void rtlsdr_set_dithering(void*d,int o){}\n")
+        with open(src2, "w") as f:
+            f.write("void *rtlsdr_open(int i){return 0;}\n"
+                    "int rtlsdr_read_sync(void*a,char*b,int c,int*d)"
+                    "{return 0;}\n")
+        import subprocess as _sp
+        lib0 = os.path.join(d2, "librtlsdr.so.0")
+        lib2 = os.path.join(d2, "librtlsdr.so.2")
+        c0 = _sp.run([gcc, "-shared", "-fPIC", "-o", lib0, src0],
+                     capture_output=True, text=True)
+        c2 = _sp.run([gcc, "-shared", "-fPIC", "-o", lib2, src2],
+                     capture_output=True, text=True)
+        if c0.returncode == 0 and c2.returncode == 0:
+            check("real 0.x build passes the ABI check",
+                  devmod._librtlsdr_abi_ok(lib0))
+            r2 = devmod._abi_reject_reason(lib2) or ""
+            check("real 2.x build rejected, reason names set_dithering",
+                  "rtlsdr_set_dithering" in r2, r2)
+            rejj = []
+            hitr = devmod.find_system_librtlsdr(
+                search_dirs=[d2], rejected=rejj, ldconfig_text="")
+            check("real dual-generation dir -> 0.x picked by the "
+                  "default validator", hitr == lib0, str(hitr))
+            d3 = tempfile.mkdtemp()
+            lib2only = os.path.join(d3, "librtlsdr.so.2")
+            _sp.run([gcc, "-shared", "-fPIC", "-o", lib2only, src2],
+                    capture_output=True, text=True)
+            rejj3 = []
+            hitr3 = devmod.find_system_librtlsdr(
+                search_dirs=[d3], rejected=rejj3, ldconfig_text="")
+            check("real 2.x-only dir -> None and reported in rejected",
+                  hitr3 is None and rejj3 == [lib2only], str(rejj3))
+            v3 = dict(devmod._LAST_PROBE["verdicts"])
+            check("verdict table names the 2.x rejection reason",
+                  "rtlsdr_set_dithering" in (v3.get(lib2only) or ""),
+                  str(v3.get(lib2only)))
+            check("probe table records scanned dirs",
+                  devmod._LAST_PROBE["dirs"] == [d3],
+                  str(devmod._LAST_PROBE["dirs"]))
+        else:
+            check("gcc build of fake libs failed (environment)", False,
+                  (c0.stderr + c2.stderr)[:120])
+    else:
+        check("gcc unavailable - real-.so checks skipped", True)
+
     print()
     if not all(CHECKS):
         print("DEVICE PROBE TEST: FAIL (%d/%d)"

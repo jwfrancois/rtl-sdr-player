@@ -13,6 +13,7 @@ import math
 import os
 import platform
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -50,12 +51,31 @@ IS_LINUX = platform.system() == "Linux"
 # (e.g. a 2.x package plus a 0.6 .so.0). The validated 0.x handle is now
 # injected into pyrtlsdr via a stub pyrtlsdrlib module and find_library
 # is pinned, so pyrtlsdr can never wander onto the 2.x soname.
+#
+# v1.7.11: petro printed "no system librtlsdr found" while ldconfig clearly
+# listed a loadable .so.0 - i.e. the box ran a STALE detector next to a
+# fresh config.py (partial deploy / stale __pycache__). The probe is now
+# self-evidencing: every candidate and its verdict is printed when nothing
+# qualifies, the linker cache (ldconfig -p) is queried for ALL librtlsdr
+# paths itself, the machine-specific multiarch dirs are scanned, and the
+# startup banner shows the backend/device.py version so a mixed deployment
+# is visible at a glance.
 # --------------------------------------------------------------------------
 
 # Set by prefer_system_librtlsdr() when Linux has no distro librtlsdr and
 # the escape hatch is unset, i.e. opening the dongle would use the wheel's
 # crash-prone bundled build. Consulted by RtlSdrDevice.__init__.
 BUNDLED_FALLBACK = False
+
+# Version of this file, printed by app.py next to config.VERSION at boot -
+# petro taught us a partial deploy can pair a new banner with an old
+# detector; a mismatch must be visible without digging through logs.
+DEVICE_LAYER_VERSION = "1.7.11"
+
+# Verdict table of the last find_system_librtlsdr() run (v1.7.11):
+# {"dirs": [...], "verdicts": [(candidate, reason-or-OK), ...]}.
+# Printed when nothing qualifies so "not found" is never opaque again.
+_LAST_PROBE = {"dirs": [], "verdicts": []}
 
 
 class BundledLibError(RuntimeError):
@@ -78,33 +98,76 @@ def bundled_fallback_message():
     )
 
 
-def _librtlsdr_abi_ok(path):
-    """True if the shared object exposes the librtlsdr 0.x API pyrtlsdr needs.
+def _abi_reject_reason(path):
+    """Why this .so cannot serve as pyrtlsdr's librtlsdr, or None if it can.
 
     pyrtlsdr binds rtlsdr_set_dithering and friends at import time; librtlsdr
     2.x (Debian 13+) removed those symbols, so loading it would crash the
     import. Such a lib must be rejected and the bundled wheel kept.
+    The reason string feeds the v1.7.11 probe table on the console.
     Never raises.
     """
     try:
         lib = ctypes.CDLL(path)
-        for sym in ("rtlsdr_open", "rtlsdr_read_sync", "rtlsdr_set_dithering"):
-            if not hasattr(lib, sym):
-                return False
-        return True
-    except OSError:
-        return False
+    except OSError as exc:
+        return "ctypes.CDLL failed: %s" % exc
+    except Exception as exc:                       # pragma: no cover
+        return "load failed: %r" % (exc,)
+    for sym in ("rtlsdr_open", "rtlsdr_read_sync", "rtlsdr_set_dithering"):
+        if not hasattr(lib, sym):
+            return "missing %s() - not a librtlsdr 0.x build" % sym
+    return None
 
 
-def find_system_librtlsdr(search_dirs=None, validate=None, rejected=None):
+def _librtlsdr_abi_ok(path):
+    """True if the shared object exposes the librtlsdr 0.x API pyrtlsdr needs.
+
+    Never raises.
+    """
+    return _abi_reject_reason(path) is None
+
+
+def _ldconfig_candidates(text=None):
+    """All librtlsdr paths the dynamic linker cache knows (v1.7.11).
+
+    Parses `/sbin/ldconfig -p` (or the given text, injectable for tests)
+    and returns the absolute paths behind every librtlsdr.so* entry -
+    including custom dirs from /etc/ld.so.conf.d that the dir scan below
+    would never visit, and BOTH generations on hybrid boxes.
+    Never raises.
+    """
+    if text is None:
+        try:
+            run = subprocess.run(["/sbin/ldconfig", "-p"],
+                                 capture_output=True, text=True, timeout=10)
+            text = run.stdout or ""
+        except Exception:
+            return []
+    paths = []
+    for line in text.splitlines():
+        if "librtlsdr.so" not in line or "=>" not in line:
+            continue
+        p = line.rsplit("=>", 1)[1].strip()
+        if p and p not in paths:
+            paths.append(p)
+    return paths
+
+
+def find_system_librtlsdr(search_dirs=None, validate=None, rejected=None,
+                          ldconfig_text=None):
     """Return a distro librtlsdr pyrtlsdr can actually use, or None.
 
-    Candidates come from ctypes.util.find_library plus a scan of the usual
-    multiarch locations on Debian/Ubuntu; each candidate must pass
-    `validate` (default: the 0.x ABI check). `search_dirs`/`validate` are
-    injectable for tests. Candidates that fail the check are appended to
-    `rejected` when a list is passed (v1.7.10: dual-generation systems
-    carry a 2.x soname next to the usable 0.x one). Never raises.
+    Candidates (deduplicated by realpath, in this order):
+      1. ctypes.util.find_library("rtlsdr")        - exotic setups
+      2. every librtlsdr path in the linker cache  - v1.7.11, covers
+        (`/sbin/ldconfig -p`)                        /etc/ld.so.conf.d dirs
+      3. glob of the usual multiarch dirs          - Debian/Ubuntu
+    Each candidate must pass `validate` (default: the 0.x ABI check).
+    `search_dirs`/`validate`/`ldconfig_text` are injectable for tests.
+    Candidates that fail the check are appended to `rejected` when a list
+    is passed (v1.7.10: dual-generation systems carry a 2.x soname next
+    to the usable 0.x one). Every verdict is recorded in _LAST_PROBE so
+    a "not found" on the console is never opaque. Never raises.
     """
     candidates = []
     try:
@@ -113,28 +176,57 @@ def find_system_librtlsdr(search_dirs=None, validate=None, rejected=None):
             candidates.append(found)
     except Exception:
         pass
+    candidates.extend(_ldconfig_candidates(ldconfig_text))
     if search_dirs is None:
+        machine = platform.machine() or "x86_64"
+        archs = [machine] + [a for a in
+                             ("x86_64", "aarch64", "arm", "i386", "riscv64")
+                             if a != machine]
         search_dirs = ["/usr/lib", "/usr/local/lib", "/lib", "/usr/lib64"]
-        search_dirs += ["/usr/lib/%s-linux-gnu" % m for m in
-                        ("x86_64", "aarch64", "arm", "i386", "riscv64")]
+        for a in archs:
+            search_dirs += ["/usr/lib/%s-linux-gnu" % a,
+                            "/lib/%s-linux-gnu" % a]
     for d in search_dirs:
         try:
             candidates.extend(
                 sorted(glob.glob(os.path.join(d, "librtlsdr.so.*"))))
         except Exception:
             continue
-    if validate is None:
-        validate = _librtlsdr_abi_ok
-    for cand in candidates:
+    seen, cands = set(), []
+    for c in candidates:
         try:
-            ok = validate(cand)
+            key = os.path.realpath(c)
         except Exception:
-            ok = False
+            key = c
+        if key not in seen:
+            seen.add(key)
+            cands.append(c)
+    using_default = validate is None
+    if using_default:
+        validate = _librtlsdr_abi_ok
+    verdicts = []
+    hit = None
+    for cand in cands:
+        try:
+            ok = bool(validate(cand))
+            err = None
+        except Exception as exc:
+            ok, err = False, exc
         if ok:
-            return cand
+            verdicts.append((cand, "OK - selected"))
+            hit = cand
+            break
+        if err is not None:
+            verdicts.append((cand, "validator error: %r" % (err,)))
+        elif using_default:
+            verdicts.append((cand, _abi_reject_reason(cand) or "rejected"))
+        else:
+            verdicts.append((cand, "rejected (custom validator)"))
         if rejected is not None:
             rejected.append(cand)
-    return None
+    _LAST_PROBE["dirs"] = list(search_dirs)
+    _LAST_PROBE["verdicts"] = verdicts
+    return hit
 
 
 class _StubWheel:
@@ -229,8 +321,14 @@ def prefer_system_librtlsdr(platform_name=None, force_bundled=None):
         report["bundled_disabled"] = True
         print("librtlsdr : using distro library %s" % path)
         if rejected:
+            why = dict(_LAST_PROBE.get("verdicts", []))
+            parts = []
+            for r in rejected:
+                reason = why.get(r, "")
+                parts.append(os.path.basename(r)
+                             + (" (%s)" % reason if reason else ""))
             print("            note    : ABI-rejected build(s) also present: %s"
-                  % ", ".join(os.path.basename(r) for r in rejected))
+                  % ", ".join(parts))
         print("            (pyrtlsdrlib wheel stubbed - pyrtlsdr is handed")
         print("            this exact handle; the wheel's own build segfaults")
         print("            in rtlsdr_read_sync on modern kernels")
@@ -254,6 +352,18 @@ def prefer_system_librtlsdr(platform_name=None, force_bundled=None):
         print("            v1.7.9+: opening the dongle will be REFUSED until a")
         print("            system librtlsdr is installed (RTLSDR_PLAYER_FORCE_BUNDLED=1")
         print("            overrides).")
+        probed = _LAST_PROBE.get("verdicts", [])
+        print("            probe   : examined %d candidate(s):" % len(probed))
+        for cand, verdict in probed:
+            print("            - %s" % cand)
+            print("              %s" % verdict)
+        if not probed:
+            print("            probe   : NO candidates at all; scanned:")
+            print("              %s" % ", ".join(_LAST_PROBE.get("dirs", [])))
+        print("            note    : if `ldconfig -p | grep rtlsdr` lists a")
+        print("            library NOT shown above, the running backend/")
+        print("            device.py is older than config.py: re-deploy")
+        print("            (git pull), delete every __pycache__ dir, restart.")
     return report
 
 

@@ -575,6 +575,16 @@ def main():
     print()
     print("  " + "=" * 58)
     print(f"   {config.APP_NAME} v{config.VERSION}")
+    try:
+        from backend import device as _device_layer
+        _dv = getattr(_device_layer, "DEVICE_LAYER_VERSION", "unknown")
+        print(f"   backend/device.py v{_dv}")
+        if _dv != config.VERSION:
+            print("   *** WARNING: backend/device.py and config.py disagree -")
+            print("   *** mixed/stale deployment. git pull, delete every")
+            print("   *** __pycache__ dir, then start again.")
+    except Exception:
+        pass
     if ARGS.share:
         print("   Server started. Open it in a browser:")
         print(f"     this machine    : {url}")
