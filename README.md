@@ -90,21 +90,43 @@ another SDR program holding the stick).
 ## Setup (Linux)
 
 ```bash
-sudo apt install librtlsdr-dev rtl-sdr            # Debian/Ubuntu
-sudo modprobe -r dvb_usb_rtl28xxu                 # free the stick for SDR mode
-pip install -r requirements.txt
-python3 app.py
+bash run.sh
 ```
 
-Or let the shipped script do everything (libusb, DVB-driver blacklist,
-udev rules, module unload):
+That is the whole install: the first run creates a virtualenv (`.venv`)
+and installs the Python dependencies (no pip into the system Python —
+Ubuntu 24.04 refuses that anyway), every later run just starts the
+server. The server listens on the LAN and the startup banner prints the
+exact URLs — from your desktop browser that is
+`http://<server-ip>:8515`. If other machines still can't connect, open
+the port in the firewall once: `sudo ufw allow 8515/tcp`.
+
+For the dongle itself (DVB-TV driver blacklist, udev rules, libusb —
+also the host-side prep for Docker):
 
 ```bash
 sudo bash linux-setup.sh
 ```
 
-macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
+Manual route, if you prefer to drive everything yourself:
+`sudo apt install librtlsdr-dev rtl-sdr`, `sudo modprobe -r
+dvb_usb_rtl28xxu`, `pip install -r requirements.txt` (in a venv),
+`python3 app.py` — add `--share` to make it reachable from other
+machines.
+
+macOS: `brew install librtlsdr`, then `bash run.sh`
 (radio works; TV does not).
+
+### "Server not reachable" from another machine (Linux)
+
+Since v1.7.3 the page's offline banner matches your OS and points at
+these fixes; the checks behind them:
+
+| Check (on the server) | Command | Fix |
+|---|---|---|
+| app running at all? | `curl -s localhost:8515/api/status` | start it: `bash run.sh` |
+| listening on the LAN, not just localhost? | `ss -tlnp \| grep 8515` → want `0.0.0.0:8515`, not `127.0.0.1:8515` | `bash run.sh` (passes `--share`) or `python3 app.py --share` |
+| firewall in the way? | `sudo ufw status` | `sudo ufw allow 8515/tcp` |
 
 ### "The player does not see my dongle" (Linux)
 

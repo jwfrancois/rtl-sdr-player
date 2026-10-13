@@ -6,6 +6,7 @@ Run:  python app.py            (opens http://localhost:8515 in your browser)
 """
 import argparse
 import asyncio
+import socket
 import threading
 import time
 import webbrowser
@@ -525,6 +526,30 @@ app.mount("/", StaticFiles(directory=str(WEB), html=True), name="web")
 
 
 # ----------------------------------------------------------------------
+def _lan_ips():
+    """Best-effort list of this machine's LAN IPv4 addresses (no traffic,
+    no DNS) so the startup banner can print the URLs other machines use."""
+    ips = set()
+    try:                                   # primary route address
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))    # no packet is actually sent
+            ips.add(s.getsockname()[0])
+        finally:
+            s.close()
+    except OSError:
+        pass
+    try:                                   # any other configured addresses
+        for info in socket.getaddrinfo(socket.gethostname(), None,
+                                       socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                ips.add(ip)
+    except OSError:
+        pass
+    return sorted(ips)
+
+
 def main():
     global ARGS
     parser = argparse.ArgumentParser(description=config.APP_NAME)
@@ -545,7 +570,18 @@ def main():
     print()
     print("  " + "=" * 58)
     print(f"   {config.APP_NAME} v{config.VERSION}")
-    print(f"   Open {url} in your browser once the server starts.")
+    if ARGS.share:
+        print("   Server started. Open it in a browser:")
+        print(f"     this machine    : {url}")
+        for ip in _lan_ips():
+            print(f"     other machines  : http://{ip}:{port}")
+        print("   Other machines can't connect? Open the port in the firewall:")
+        print(f"     sudo ufw allow {port}/tcp          (if you use ufw)")
+        print("   Prefer localhost-only? Run app.py without --share.")
+    else:
+        print(f"   Open {url} in your browser once the server starts.")
+        print("   (Listening on this machine only - start with --share, or use")
+        print("    run.sh, to open it from other devices on your network.)")
     print("   Press Ctrl+C to quit.")
     print("  " + "=" * 58)
     print()

@@ -131,10 +131,37 @@ async function refreshStatus() {
 
 // Server went away (run.bat closed, PC rebooted, crashed). The dead page
 // used to just spam the console — now it explains itself and recovers.
+// v1.7.3: the fix hint is platform-aware (Windows -> run.bat, Linux/macOS ->
+// bash run.sh) and a LAN hostname adds the --share / firewall pointers.
 function markOffline() {
   S.offline = true;
   const host = $("offline-host");
   if (host) host.textContent = location.host || "localhost:8515";
+  const fix = $("off-fix");
+  if (fix) {
+    const ua = navigator.userAgent || "";
+    const onServer =
+      location.hostname && location.hostname !== "localhost" &&
+      !/^127\./.test(location.hostname);
+    const port = parseInt(location.port, 10) || 8515;
+    const isWin = /Win/i.test(ua) && !/Linux/i.test(ua);
+    if (isWin) {
+      fix.innerHTML = "The player app is not running: double-click " +
+        "<strong>run.bat</strong> in the app folder and leave its window open. ";
+    } else if (onServer) {
+      fix.innerHTML = "The player app is not running on the server (or not " +
+        "reachable from this machine): start it with <strong>bash run.sh</strong> " +
+        "in the app folder and leave the terminal open" +
+        (/Linux/i.test(ua)
+          ? ", or check the firewall: <strong>sudo ufw allow " + port +
+            "/tcp</strong>"
+          : "") + ". ";
+    } else {
+      fix.innerHTML = "The player app is not running: start it with " +
+        "<strong>bash run.sh</strong> in the app folder and leave the " +
+        "terminal open. ";
+    }
+  }
   $("offline-banner").hidden = false;
   $("device-name").textContent = "server offline";
   $("status-dot").className = "dot off";

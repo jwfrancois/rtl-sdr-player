@@ -1,11 +1,15 @@
 # RTL-SDR Player — Python dependencies
-# Install with:  pip install -r requirements.txt
+# Install with:  bash run.sh            (creates .venv + installs these)
+#             or pip install -r requirements.txt
 #
-# pyrtlsdrlib ships prebuilt native librtlsdr binaries (including the
-# correct 64-bit Windows DLL with libusb statically linked). pyrtlsdr
-# picks it up automatically, so NO manual DLL download is needed on
-# Windows. The dlls\ folder in the app is the offline fallback.
-# Linux still needs the system package: sudo apt install librtlsdr-dev rtl-sdr
+# pyrtlsdrlib ships prebuilt native librtlsdr binaries (the correct 64-bit
+# Windows DLL, and on Linux the .so bundle incl. libusb/libudev). pyrtlsdr
+# picks them up automatically, so NO manual DLL download is needed on
+# Windows and NO apt librtlsdr package is needed on Linux. The dlls\ folder
+# in the app is the offline fallback on Windows.
+# Useful but optional on Linux: sudo apt install rtl-sdr   (rtl_test etc.);
+# USB access (DVB blacklist + udev rules) is handled by:
+#   sudo bash linux-setup.sh
 
 fastapi>=0.110
 uvicorn[standard]>=0.29
