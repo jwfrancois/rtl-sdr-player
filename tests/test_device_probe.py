@@ -263,22 +263,28 @@ def main():
 
     saved = sys.modules.get("pyrtlsdrlib", "absent")
     orig_finder = devmod.find_system_librtlsdr
+    import ctypes.util as _ctutil
+    saved_find = _ctutil.find_library
     try:
-        devmod.find_system_librtlsdr = lambda search_dirs=None: fake
+        devmod.find_system_librtlsdr = (
+            lambda search_dirs=None, rejected=None: fake)
         rep = devmod.prefer_system_librtlsdr(platform_name="linux",
                                              force_bundled=True)
         check("RTLSDR_PLAYER_FORCE_BUNDLED escape hatch keeps the wheel",
               rep["bundled_disabled"] is False)
         rep2 = devmod.prefer_system_librtlsdr(platform_name="linux")
+        _entry = sys.modules.get("pyrtlsdrlib")
         check("linux + distro lib -> bundled wheel disabled",
               rep2["bundled_disabled"] is True
-              and sys.modules.get("pyrtlsdrlib") is None)
+              and (_entry is None
+                   or getattr(_entry, "rtlsdr_player_stub", False)))
         rep3 = devmod.prefer_system_librtlsdr(platform_name="win32")
         check("windows -> no-op (bundled dll logic untouched)",
               rep3["bundled_disabled"] is False
               and rep3["system"] is None)
     finally:
         devmod.find_system_librtlsdr = orig_finder
+        _ctutil.find_library = saved_find
         if saved == "absent":
             sys.modules.pop("pyrtlsdrlib", None)
         else:
@@ -292,7 +298,8 @@ def main():
     saved_flag = devmod.BUNDLED_FALLBACK
     saved_finder = devmod.find_system_librtlsdr
     try:
-        devmod.find_system_librtlsdr = lambda search_dirs=None: None
+        devmod.find_system_librtlsdr = (
+            lambda search_dirs=None, rejected=None: None)
         devmod.BUNDLED_FALLBACK = False   # pretend a system lib was present
         devmod.prefer_system_librtlsdr(platform_name="linux",
                                        force_bundled=True)
@@ -357,6 +364,100 @@ def main():
                   ident_path != "unknown"
                   and ".so" in os.path.basename(ident_path),
                   ident_path)
+
+    # -- v1.7.10: dual-generation systems (.so.0 next to .so.2) -------------
+    # The validator must report ABI-rejected builds; the success path must
+    # stub the pyrtlsdrlib slot with the validated handle and pin
+    # find_library('rtlsdr') to that binary.
+    import ctypes.util
+
+    d = tempfile.mkdtemp()
+    good = os.path.join(d, "librtlsdr.so.0")
+    bad = os.path.join(d, "librtlsdr.so.2")
+    open(good, "w").close()
+    open(bad, "w").close()
+    rej = []
+    # model petro: find_library hands back the 2.x soname FIRST (ldconfig
+    # lists it first there), then the glob adds both sonames
+    saved_fl = ctypes.util.find_library
+    try:
+        ctypes.util.find_library = (
+            lambda name: bad if name in ("rtlsdr", "librtlsdr") else None)
+        hit = devmod.find_system_librtlsdr(
+            search_dirs=[d],
+            validate=lambda p: p.endswith(".so.0"),
+            rejected=rej)
+    finally:
+        ctypes.util.find_library = saved_fl
+    check("dual-generation dir -> validated .so.0 wins", hit == good, str(hit))
+    check("ABI-rejected .so.2 is reported", rej == [bad], str(rej))
+
+    saved_mod10 = sys.modules.get("pyrtlsdrlib", "absent")
+    saved_find10 = ctypes.util.find_library
+    saved_flag10 = devmod.BUNDLED_FALLBACK
+    saved_finder10 = devmod.find_system_librtlsdr
+    try:
+        # gate on rtlsdr importability BEFORE the stub is installed
+        try:
+            importlib.import_module("rtlsdr")
+            have_rtlsdr = True
+        except Exception:
+            have_rtlsdr = False
+        # a real, loadable .so: libm exists on every Linux (the stubbed
+        # finder bypasses the ABI validate)
+        real_so = ctypes.util.find_library("m") or None
+        if real_so:
+            devmod.find_system_librtlsdr = (
+                lambda search_dirs=None, rejected=None: real_so)
+            devmod.BUNDLED_FALLBACK = False
+            rep10 = devmod.prefer_system_librtlsdr(platform_name="linux")
+            stub = sys.modules.get("pyrtlsdrlib")
+            check("success path installs a stub wheel module",
+                  rep10["bundled_disabled"] is True
+                  and getattr(stub, "rtlsdr_player_stub", False) is True)
+            if getattr(stub, "rtlsdr_player_stub", False):
+                h = stub.load_librtlsdr()
+                check("stub hands pyrtlsdr a live CDLL handle",
+                      h is not None and getattr(h, "_name", "") == real_so,
+                      str(h))
+            check("find_library('rtlsdr') pinned to the validated lib",
+                  ctypes.util.find_library("rtlsdr") == real_so,
+                  ctypes.util.find_library("rtlsdr"))
+            check("find_library('librtlsdr') pinned too",
+                  ctypes.util.find_library("librtlsdr") == real_so)
+            check("unrelated find_library queries pass through",
+                  ctypes.util.find_library("definitely-not-a-lib-xyz")
+                  is None)
+            if have_rtlsdr and sys.platform.startswith("linux"):
+                # purge and re-import: pyrtlsdr must consult the stub and
+                # try to bind libm -> AttributeError at symbol binding.
+                # (ImportError instead would mean the stub was ignored and
+                # pyrtlsdr's own chain ran out - the pre-v1.7.10 behavior.)
+                for _m in [k for k in list(sys.modules)
+                           if k == "rtlsdr" or k.startswith("rtlsdr.")]:
+                    del sys.modules[_m]
+                try:
+                    importlib.import_module("rtlsdr")
+                    raised = "no exception"
+                except AttributeError:
+                    raised = "attributeerror"
+                except ImportError:
+                    raised = "importerror"
+                except Exception as exc:
+                    raised = "other: %r" % (exc,)
+                check("pyrtlsdr consults the stub wheel first",
+                      raised == "attributeerror", raised)
+                for _m in [k for k in list(sys.modules)
+                           if k == "rtlsdr" or k.startswith("rtlsdr.")]:
+                    del sys.modules[_m]
+    finally:
+        devmod.find_system_librtlsdr = saved_finder10
+        devmod.BUNDLED_FALLBACK = saved_flag10
+        ctypes.util.find_library = saved_find10
+        if saved_mod10 == "absent":
+            sys.modules.pop("pyrtlsdrlib", None)
+        else:
+            sys.modules["pyrtlsdrlib"] = saved_mod10
 
     print()
     if not all(CHECKS):

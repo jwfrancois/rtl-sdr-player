@@ -45,6 +45,11 @@ IS_LINUX = platform.system() == "Linux"
 # actionable BundledLibError instead (the server stays up in simulation
 # mode and the UI shows the fix). A deliberate error beats a segfaulted
 # server: the crash made the fix invisible on a headless box.
+#
+# v1.7.10: hybrid systems carry BOTH librtlsdr generations side by side
+# (e.g. a 2.x package plus a 0.6 .so.0). The validated 0.x handle is now
+# injected into pyrtlsdr via a stub pyrtlsdrlib module and find_library
+# is pinned, so pyrtlsdr can never wander onto the 2.x soname.
 # --------------------------------------------------------------------------
 
 # Set by prefer_system_librtlsdr() when Linux has no distro librtlsdr and
@@ -91,13 +96,15 @@ def _librtlsdr_abi_ok(path):
         return False
 
 
-def find_system_librtlsdr(search_dirs=None, validate=None):
+def find_system_librtlsdr(search_dirs=None, validate=None, rejected=None):
     """Return a distro librtlsdr pyrtlsdr can actually use, or None.
 
     Candidates come from ctypes.util.find_library plus a scan of the usual
     multiarch locations on Debian/Ubuntu; each candidate must pass
     `validate` (default: the 0.x ABI check). `search_dirs`/`validate` are
-    injectable for tests. Never raises.
+    injectable for tests. Candidates that fail the check are appended to
+    `rejected` when a list is passed (v1.7.10: dual-generation systems
+    carry a 2.x soname next to the usable 0.x one). Never raises.
     """
     candidates = []
     try:
@@ -120,11 +127,65 @@ def find_system_librtlsdr(search_dirs=None, validate=None):
         validate = _librtlsdr_abi_ok
     for cand in candidates:
         try:
-            if validate(cand):
-                return cand
+            ok = validate(cand)
         except Exception:
-            continue
+            ok = False
+        if ok:
+            return cand
+        if rejected is not None:
+            rejected.append(cand)
     return None
+
+
+class _StubWheel:
+    """Stand-in for the pyrtlsdrlib wheel module (v1.7.10).
+
+    pyrtlsdr's loader consults `pyrtlsdrlib.load_librtlsdr()` first; a
+    stub in its sys.modules slot hands pyrtlsdr EXACTLY the validated
+    distro handle instead of letting its chain (find_library et al)
+    wander onto a 2.x soname. `handle=None` degrades to pyrtlsdr's own
+    chain, i.e. the pre-v1.7.10 behavior.
+    """
+
+    rtlsdr_player_stub = True
+
+    def __init__(self, handle):
+        self._handle = handle
+
+    def load_librtlsdr(self):
+        return self._handle
+
+
+def _pin_find_library_to(path, report=None):
+    """Pin ctypes.util.find_library('rtlsdr') to a validated 0.x build.
+
+    pyrtlsdr's loader chain ends with find_library('rtlsdr'); on systems
+    carrying both librtlsdr generations, ldconfig may hand back the 2.x
+    soname first - and 2.x dropped rtlsdr_set_dithering, so binding it
+    kills the rtlsdr import with an AttributeError. The distro lib has
+    already been validated by find_system_librtlsdr(); make every
+    find_library query for rtlsdr resolve to exactly that binary.
+    Must run BEFORE anything imports rtlsdr (pyrtlsdr does
+    `from ctypes.util import find_library` at its own import time).
+    Never raises.
+    """
+    try:
+        orig = ctypes.util.find_library
+
+        def _pinned(name, *args, **kwargs):
+            if name in ("rtlsdr", "librtlsdr"):
+                return path
+            return orig(name, *args, **kwargs)
+
+        ctypes.util.find_library = _pinned
+        sub = sys.modules.get("rtlsdr.librtlsdr")
+        if sub is not None:                    # already imported somewhere
+            sub.find_library = _pinned
+        if report is not None:
+            report["find_library_pinned"] = path
+        return True
+    except Exception:
+        return False
 
 
 def prefer_system_librtlsdr(platform_name=None, force_bundled=None):
@@ -135,7 +196,9 @@ def prefer_system_librtlsdr(platform_name=None, force_bundled=None):
     (the Windows DLL situation is handled by setup.bat / check_dlls.py).
     Since v1.7.9 it also sets the module-global BUNDLED_FALLBACK when a
     Linux box has no distro librtlsdr (and the escape hatch is unset) -
-    RtlSdrDevice refuses to open in that state.
+    RtlSdrDevice refuses to open in that state. Since v1.7.10 the success
+    path stubs the pyrtlsdrlib slot with the validated 0.x handle and
+    pins find_library('rtlsdr') to it (dual-generation .so.0+.so.2 boxes).
     """
     report = {"system": None, "bundled_disabled": False}
     if force_bundled is None:
@@ -144,16 +207,33 @@ def prefer_system_librtlsdr(platform_name=None, force_bundled=None):
         return report
     if not (platform_name or sys.platform).startswith("linux"):
         return report
-    path = find_system_librtlsdr()
+    rejected = []
+    path = find_system_librtlsdr(rejected=rejected)
     report["system"] = path
+    report["rejected"] = rejected
     if path:
-        # next `import pyrtlsdrlib` raises ImportError -> pyrtlsdr's loader
-        # falls through to LD_LIBRARY_PATH / find_library (the distro lib)
-        sys.modules["pyrtlsdrlib"] = None
+        # v1.7.5: neutralize the wheel so its own build is never loaded.
+        # v1.7.10: merely disabling it is NOT enough on hybrid systems -
+        # pyrtlsdr's chain ends with find_library('rtlsdr'), and ldconfig
+        # may list a 2.x soname first (binding it kills the rtlsdr import:
+        # 2.x dropped rtlsdr_set_dithering). So hand pyrtlsdr the validated
+        # 0.x handle directly via a stub wheel module. The ABI guard has
+        # already CDLL'd the file, so loading it here is free; if the CDLL
+        # somehow fails, the stub degrades to pyrtlsdr's own chain.
+        try:
+            handle = ctypes.CDLL(path)
+        except OSError:
+            handle = None
+        sys.modules["pyrtlsdrlib"] = _StubWheel(handle)
+        _pin_find_library_to(path, report)
         report["bundled_disabled"] = True
         print("librtlsdr : using distro library %s" % path)
-        print("            (pyrtlsdrlib wheel build disabled - it can segfault")
-        print("            in rtlsdr_read_sync on modern kernels;")
+        if rejected:
+            print("            note    : ABI-rejected build(s) also present: %s"
+                  % ", ".join(os.path.basename(r) for r in rejected))
+        print("            (pyrtlsdrlib wheel stubbed - pyrtlsdr is handed")
+        print("            this exact handle; the wheel's own build segfaults")
+        print("            in rtlsdr_read_sync on modern kernels")
         print("            RTLSDR_PLAYER_FORCE_BUNDLED=1 overrides this)")
     else:
         # v1.7.7: the crash-prone bundled fallback must not be silent -
@@ -937,7 +1017,10 @@ def open_device(prefer_sim=False):
     if not prefer_sim:
         try:
             from rtlsdr import RtlSdr  # deferred import: friendly errors
-        except (ImportError, OSError):
+        except Exception:
+            # v1.7.10: a 2.x librtlsdr reaching pyrtlsdr's loader raises
+            # AttributeError at symbol binding, not ImportError - the
+            # player must degrade to sim with a hint, never die at boot.
             hint = _import_error_hint()
         else:
             try:

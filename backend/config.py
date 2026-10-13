@@ -7,7 +7,7 @@ import json
 import os
 
 APP_NAME = "RTL-SDR Player"
-VERSION = "1.7.9"
+VERSION = "1.7.10"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)

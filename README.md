@@ -191,6 +191,16 @@ package) is a handy independent check that the distro library and dongle
 cooperate. Escape hatch if you ever need the wheel's build back:
 `RTLSDR_PLAYER_FORCE_BUNDLED=1 bash run.sh`.
 
+Some boxes end up with **both** librtlsdr generations installed side by
+side (`librtlsdr.so.0` from 0.6.x plus a `librtlsdr.so.2` from a 2.x
+package — `dpkg -S /lib/x86_64-linux-gnu/librtlsdr.so.2` tells you which
+package owns the 2.x copy). Since v1.7.10 the loader handles that: the
+ABI-validated 0.x handle is handed to pyrtlsdr directly (via a stub
+pyrtlsdrlib module) and `find_library('rtlsdr')` is pinned to it, while
+the console names every ABI-rejected build. Without this, whichever
+soname ldconfig listed first won — and the 2.x API kills pyrtlsdr's
+import (`AttributeError: rtlsdr_set_dithering`).
+
 ---
 
 ## Setup (Ubuntu server / Docker)
