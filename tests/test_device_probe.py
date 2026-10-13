@@ -284,6 +284,49 @@ def main():
         else:
             sys.modules["pyrtlsdrlib"] = saved
 
+    # -- v1.7.9: hard refusal of the bundled fallback -----------------------
+    # With no distro lib on Linux, prefer_system_librtlsdr() must record
+    # BUNDLED_FALLBACK (the escape hatch and off-Linux platforms must leave
+    # it False), the guard message must name the fix, and RtlSdrDevice must
+    # raise BundledLibError instead of opening the dongle.
+    saved_flag = devmod.BUNDLED_FALLBACK
+    saved_finder = devmod.find_system_librtlsdr
+    try:
+        devmod.find_system_librtlsdr = lambda search_dirs=None: None
+        devmod.BUNDLED_FALLBACK = False   # pretend a system lib was present
+        devmod.prefer_system_librtlsdr(platform_name="linux",
+                                       force_bundled=True)
+        check("escape hatch -> BUNDLED_FALLBACK stays False",
+              devmod.BUNDLED_FALLBACK is False)
+        devmod.prefer_system_librtlsdr(platform_name="linux")
+        check("linux + no distro lib -> BUNDLED_FALLBACK recorded",
+              devmod.BUNDLED_FALLBACK is True)
+        devmod.prefer_system_librtlsdr(platform_name="win32")
+        check("off-linux call leaves the flag alone",
+              devmod.BUNDLED_FALLBACK is True)
+        gmsg = devmod.bundled_fallback_message()
+        check("guard message names apt fix + escape hatch",
+              "librtlsdr0" in gmsg and "linux-setup.sh" in gmsg
+              and "RTLSDR_PLAYER_FORCE_BUNDLED" in gmsg)
+        try:
+            importlib.import_module("rtlsdr")
+            have_rtlsdr = True
+        except Exception:
+            have_rtlsdr = False
+        if have_rtlsdr and sys.platform.startswith("linux"):
+            try:
+                devmod.RtlSdrDevice(0)
+                raised = "no exception"
+            except devmod.BundledLibError as exc:
+                raised = "librtlsdr0" in str(exc)
+            except Exception as exc:
+                raised = "wrong exc: %r" % (exc,)
+            check("__init__ refuses to open with the bundled build",
+                  raised is True, str(raised))
+    finally:
+        devmod.find_system_librtlsdr = saved_finder
+        devmod.BUNDLED_FALLBACK = saved_flag
+
     # -- v1.7.8: native library identity (sys.modules + /proc/self/maps) ----
     lst = devmod._mapped_paths("definitely-not-mapped-anywhere-xyz")
     check("_mapped_paths returns [] for absent needle", lst == [])

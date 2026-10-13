@@ -39,7 +39,40 @@ IS_LINUX = platform.system() == "Linux"
 # Linux SDR tool uses. If a distro librtlsdr is present we make
 # `import pyrtlsdrlib` fail, so pyrtlsdr falls through to the system
 # library. Set RTLSDR_PLAYER_FORCE_BUNDLED=1 to keep the wheel's build.
+#
+# v1.7.9: a Linux box with NO distro librtlsdr no longer falls back to the
+# bundled build silently - RtlSdrDevice refuses to open and raises a clean,
+# actionable BundledLibError instead (the server stays up in simulation
+# mode and the UI shows the fix). A deliberate error beats a segfaulted
+# server: the crash made the fix invisible on a headless box.
 # --------------------------------------------------------------------------
+
+# Set by prefer_system_librtlsdr() when Linux has no distro librtlsdr and
+# the escape hatch is unset, i.e. opening the dongle would use the wheel's
+# crash-prone bundled build. Consulted by RtlSdrDevice.__init__.
+BUNDLED_FALLBACK = False
+
+
+class BundledLibError(RuntimeError):
+    """Opening the dongle would use the wheel's bundled librtlsdr."""
+
+
+def bundled_fallback_message():
+    """Actionable text for the bundled-fallback refusal (console + UI)."""
+    return (
+        "no system librtlsdr was found, so the dongle would open with the "
+        "pyrtlsdrlib wheel's bundled build - which segfaults in "
+        "rtlsdr_read_sync on modern kernels (observed on Ubuntu 24.04). "
+        "Opening is refused.\n"
+        "fix: install the distro library, then restart the player:\n"
+        "    sudo apt install librtlsdr0 rtl-sdr\n"
+        "  (Ubuntu: the package lives in the 'universe' repo:\n"
+        "    sudo add-apt-repository universe && sudo apt update)\n"
+        "  or simply re-run:  sudo bash linux-setup.sh\n"
+        "override anyway (NOT recommended): export RTLSDR_PLAYER_FORCE_BUNDLED=1"
+    )
+
+
 def _librtlsdr_abi_ok(path):
     """True if the shared object exposes the librtlsdr 0.x API pyrtlsdr needs.
 
@@ -100,6 +133,9 @@ def prefer_system_librtlsdr(platform_name=None, force_bundled=None):
     Runs once at import time, before anything imports rtlsdr. Returns a
     small report dict for diagnostics and tests. Windows/macOS: no-op
     (the Windows DLL situation is handled by setup.bat / check_dlls.py).
+    Since v1.7.9 it also sets the module-global BUNDLED_FALLBACK when a
+    Linux box has no distro librtlsdr (and the escape hatch is unset) -
+    RtlSdrDevice refuses to open in that state.
     """
     report = {"system": None, "bundled_disabled": False}
     if force_bundled is None:
@@ -121,9 +157,13 @@ def prefer_system_librtlsdr(platform_name=None, force_bundled=None):
         print("            RTLSDR_PLAYER_FORCE_BUNDLED=1 overrides this)")
     else:
         # v1.7.7: the crash-prone bundled fallback must not be silent -
-        # this exact fallback looks identical to the pre-v1.7.5 segfault
+        # this exact fallback looks identical to the pre-v1.7.5 segfault.
+        # v1.7.9: opening the dongle is now refused outright (see
+        # RtlSdrDevice.__init__) - a clean error beats a segfaulted server.
+        global BUNDLED_FALLBACK
+        BUNDLED_FALLBACK = True
         print("librtlsdr : WARNING - no system librtlsdr found; the")
-        print("            pyrtlsdrlib wheel's bundled build will be used. It")
+        print("            pyrtlsdrlib wheel's bundled build would be used. It")
         print("            carries its own old libusb and is known to segfault")
         print("            in rtlsdr_read_sync on modern kernels (observed on")
         print("            Ubuntu 24.04 within seconds of opening the dongle).")
@@ -131,6 +171,9 @@ def prefer_system_librtlsdr(platform_name=None, force_bundled=None):
         print("            ubuntu : the package lives in the 'universe' repo -")
         print("                     sudo add-apt-repository universe && sudo apt update")
         print("            or simply: sudo bash linux-setup.sh")
+        print("            v1.7.9+: opening the dongle will be REFUSED until a")
+        print("            system librtlsdr is installed (RTLSDR_PLAYER_FORCE_BUNDLED=1")
+        print("            overrides).")
     return report
 
 
@@ -421,6 +464,16 @@ class RtlSdrDevice:
 
     def __init__(self, index=0):
         from rtlsdr import RtlSdr  # deferred import: gives friendly errors upstream
+
+        # v1.7.9: hard guard - never open with the wheel's bundled librtlsdr.
+        # It segfaults the whole server seconds into streaming (rtlsdr_read_sync
+        # on modern kernels); a clean, actionable error keeps the player up
+        # and names the fix on the console AND in the UI status bar.
+        if BUNDLED_FALLBACK and sys.platform.startswith("linux"):
+            _msg = bundled_fallback_message()
+            print("librtlsdr : REFUSING to open the dongle - "
+                  + _msg.replace("\n", "\n            "))
+            raise BundledLibError(_msg)
 
         print("librtlsdr : opening dongle on index %s" % index)
 
@@ -913,6 +966,11 @@ def open_device(prefer_sim=False):
 
 
 def _usb_error_hint(exc):
+    # v1.7.9: the bundled-build refusal already carries the exact fix -
+    # pass it through untouched (the sysfs probe would mislabel it, e.g.
+    # as a missing dongle).
+    if isinstance(exc, BundledLibError):
+        return str(exc)
     msg = str(exc)
     if not IS_WINDOWS:
         # Linux: the sysfs probe knows far more than the exception string.

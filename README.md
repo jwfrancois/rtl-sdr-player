@@ -181,6 +181,11 @@ crash-prone bundled build, the console prints a WARNING with the fix, and
 every dongle open announces the native library it is actually using
 (identified via the loader and the process memory map, v1.7.8 — the
 `usb:` line shows which libusb the native library is really bound to).
+Since v1.7.9 the player goes one step further: **it refuses to open the
+dongle at all** when only the bundled build is available. The server stays
+up in simulation mode and raises a clean `BundledLibError` whose message
+is the fix itself (shown on the console and in the UI status bar) — a
+deliberate error beats an accidental segfault on a headless box.
 `rtl_test` (from the `rtl-sdr`
 package) is a handy independent check that the distro library and dongle
 cooperate. Escape hatch if you ever need the wheel's build back:
