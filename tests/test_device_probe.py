@@ -160,13 +160,18 @@ def main():
     else:
         print("  (unwritable-node case skipped: root or non-POSIX)")
 
-    # never raises on a missing tree; still produces a verdict for the UI
+    # never raises on a missing tree; on Linux it still produces a verdict
+    # for the UI, while off-Linux the probe intentionally no-ops
     tmp = tempfile.mkdtemp()
     rep = devmod.probe_linux_usb(
         sys_root=os.path.join(tmp, "missing"), mod_root=tmp, dev_root=tmp)
-    check("missing sysfs -> clean report with verdict",
-          rep["present"] is False and rep["hint"]
-          and "probe unavailable" in rep["hint"])
+    if devmod.IS_LINUX:
+        check("missing sysfs -> clean report with verdict",
+              rep["present"] is False and rep["hint"]
+              and "probe unavailable" in rep["hint"])
+    else:
+        CHECKS.append(True)
+        print("  (missing-sysfs verdict skipped: probe no-ops off-Linux)")
 
     print()
     if not all(CHECKS):
