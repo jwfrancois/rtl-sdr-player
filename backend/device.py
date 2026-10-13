@@ -756,7 +756,9 @@ def _import_error_hint():
     if not IS_WINDOWS:
         return (
             "pyrtlsdr is installed but librtlsdr was not found. "
-            "Install it with your package manager, e.g. sudo apt install librtlsdr0 rtl-sdr"
+            "Install it with your package manager, e.g. sudo apt install "
+            "librtlsdr0 rtl-sdr (on Ubuntu the package lives in the "
+            "'universe' component: sudo add-apt-repository universe first)"
         )
 
     rep = windows_dll_report()

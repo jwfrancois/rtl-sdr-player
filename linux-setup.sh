@@ -33,14 +33,53 @@ if command -v apt-get >/dev/null 2>&1; then
   else
     echo "-- libusb-1.0-0 already installed"
   fi
-  # v1.7.5: the player prefers the DISTRO librtlsdr over the Python wheel's
-  # bundled snapshot (that one can segfault on modern kernels).
+  # v1.7.5/1.7.6: the player prefers the DISTRO librtlsdr over the Python
+  # wheel's bundled snapshot (that one can segfault on modern kernels).
   if dpkg -s librtlsdr0 >/dev/null 2>&1; then
     echo "-- librtlsdr0 already installed"
   else
     echo "-- installing librtlsdr0 + rtl-sdr (distro native library + tools)"
-    apt-get install -y -qq librtlsdr0 rtl-sdr || \
-      echo "   (could not install automatically - run: sudo apt install librtlsdr0 rtl-sdr)"
+    # rtl-sdr lives in the 'universe' component on Ubuntu; minimal/server
+    # images often ship without it, so enable it if apt cannot see the pkg
+    if ! apt-get install --dry-run -qq librtlsdr0 >/dev/null 2>&1; then
+      echo "-- librtlsdr0 is not visible to apt: enabling Ubuntu 'universe'"
+      if command -v add-apt-repository >/dev/null 2>&1; then
+        add-apt-repository -y universe >/dev/null 2>&1 || true
+      fi
+      for f in /etc/apt/sources.list.d/*.sources; do
+        # deb822 sources (Ubuntu 24.04): append 'universe' to every
+        # Components: line that does not have it yet
+        if [ -f "$f" ] && grep -q "^Components:" "$f" \
+           && ! grep "^Components:" "$f" | grep -q universe; then
+          sed -i '/^Components: /{/universe/!s/^Components: \(.*\)$/Components: \1 universe/}' "$f"
+          echo "   (added universe to $f)"
+        fi
+      done
+      apt-get update -qq 2>/dev/null || true
+    fi
+    if apt-get install -y -qq librtlsdr0 rtl-sdr 2>/dev/null; then
+      echo "-- librtlsdr0 + rtl-sdr installed"
+    else
+      echo "-- apt route failed: downloading the .deb directly"
+      tmp=$(mktemp -d)
+      URL="http://archive.ubuntu.com/ubuntu/pool/universe/r/rtl-sdr/librtlsdr0_0.6.0-4_amd64.deb"
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$tmp/librtlsdr0.deb" "$URL" || true
+      elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp/librtlsdr0.deb" "$URL" || true
+      fi
+      if [ -s "$tmp/librtlsdr0.deb" ]; then
+        dpkg -i "$tmp/librtlsdr0.deb" || apt-get install -y -f -qq || true
+      fi
+      rm -rf "$tmp"
+      if dpkg -s librtlsdr0 >/dev/null 2>&1; then
+        echo "-- librtlsdr0 installed (direct .deb route)"
+      else
+        echo "   (could not install automatically. On Ubuntu run:"
+        echo "    sudo add-apt-repository universe && sudo apt update \\"
+        echo "    && sudo apt install librtlsdr0 rtl-sdr)"
+      fi
+    fi
   fi
 else
   echo "-- apt-get not found: make sure libusb-1.0 and librtlsdr are installed"

@@ -165,6 +165,12 @@ sudo apt install librtlsdr0 rtl-sdr     # or: sudo bash linux-setup.sh
 bash run.sh
 ```
 
+On Ubuntu the package lives in the **universe** component; minimal server
+images sometimes ship without it. If apt says `Unable to locate package
+librtlsdr0`: `sudo add-apt-repository universe && sudo apt update` first
+(or let `linux-setup.sh` do it — since v1.7.6 it enables universe and, as
+a last resort, installs the .deb directly).
+
 The console prints the exact binary in use, and
 `curl -s localhost:8515/api/status | python3 -m json.tool | grep librtlsdr`
 shows it too — it should be a system path like
