@@ -173,6 +173,67 @@ def main():
         CHECKS.append(True)
         print("  (missing-sysfs verdict skipped: probe no-ops off-Linux)")
 
+    # ---- v1.7.4: device call serialization --------------------------------
+    # librtlsdr is not thread-safe; every RtlSdrDevice entry point must run
+    # on one reentrant lock. Drive a fake .sdr from two threads and verify
+    # a streaming read excludes concurrent control calls.
+    import threading
+    import time as _time
+
+    import numpy as np
+
+    dev = devmod.RtlSdrDevice.__new__(devmod.RtlSdrDevice)  # no hw, no pyrtlsdr
+    dev._dev_lock = threading.RLock()
+    dev._open = True
+    dev.index = 0
+
+    events = []
+
+    class FakeSdr:
+        def read_samples(self, n):
+            events.append("read+")
+            _time.sleep(0.02)
+            events.append("read-")
+            return np.zeros(n, dtype=np.complex64)
+
+        def get_gains(self):
+            events.append("gains+")
+            _time.sleep(0.005)
+            events.append("gains-")
+            return [0]
+
+    dev.sdr = FakeSdr()
+
+    def _reader():
+        for _ in range(8):
+            dev.read_iq(1024)
+
+    def _poller():
+        for _ in range(8):
+            dev.get_gains()
+
+    ts = [threading.Thread(target=_reader), threading.Thread(target=_poller)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+    depth = 0
+    interleaved = 0
+    for ev in events:
+        depth += 1 if ev.endswith("+") else -1
+        if depth > 1:
+            interleaved += 1
+    check("device calls never interleave across threads", interleaved == 0,
+          f"{len(events)} events")
+    try:
+        with dev._dev_lock:
+            dev.get_gains()        # same-thread reentry must not deadlock
+        check("lock is reentrant (nested same-thread call)", True)
+    except Exception as exc:
+        check("lock is reentrant (nested same-thread call)", False, str(exc))
+    check("read_iq still returns the block", len(dev.read_iq(64)) == 64)
+
     print()
     if not all(CHECKS):
         print("DEVICE PROBE TEST: FAIL (%d/%d)"

@@ -6,11 +6,16 @@ Run:  python app.py            (opens http://localhost:8515 in your browser)
 """
 import argparse
 import asyncio
+import faulthandler
 import socket
 import threading
 import time
 import webbrowser
 from pathlib import Path
+
+# v1.7.4: a native crash (segfault in librtlsdr/libusb) must leave a
+# Python-level trace of every thread, not just "Segmentation fault".
+faulthandler.enable()
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect

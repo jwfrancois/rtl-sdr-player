@@ -12,7 +12,9 @@ import os
 import platform
 import struct
 import sys
+import threading
 import time
+from functools import wraps
 
 import numpy as np
 
@@ -20,6 +22,30 @@ from . import rds as rds_mod
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
+
+
+# --------------------------------------------------------------------------
+# Device call serialization (v1.7.4)
+#
+# librtlsdr is NOT thread-safe, and the player calls it from several
+# threads: the USB reader streams via read_samples (an active rtlsdr
+# read_async session) while API threads ask for the gain table and the
+# DSP thread applies gain changes. Concurrent control transfers during
+# an active async session corrupt librtlsdr's state and SIGSEGV the
+# process (observed on Ubuntu: "Found Rafael Micro R820T/2 tuner" ->
+# "Disabled direct sampling mode" -> Segmentation fault, within one
+# status poll of boot). Every entry point below therefore funnels
+# through one reentrant lock; libusb itself serializes transfers fine
+# (this is the rtl_tcp model), it is librtlsdr's own state that needs
+# the discipline.
+# --------------------------------------------------------------------------
+def _devlocked(fn):
+    """Serialize a RtlSdrDevice method on its per-instance RLock."""
+    @wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._dev_lock:
+            return fn(self, *args, **kwargs)
+    return wrapper
 
 # --------------------------------------------------------------------------
 # Linux USB probe (v1.7.2): "the player does not see my dongle" on Ubuntu
@@ -236,13 +262,16 @@ class RtlSdrDevice:
     def __init__(self, index=0):
         from rtlsdr import RtlSdr  # deferred import: gives friendly errors upstream
 
+        self._dev_lock = threading.RLock()   # guards every librtlsdr call
         self.index = index
         try:
             # pyrtlsdr >= 0.5.0 (also accepts serial_number=)
-            self.sdr = RtlSdr(device_index=index)
+            with self._dev_lock:
+                self.sdr = RtlSdr(device_index=index)
         except TypeError:
             # older pyrtlsdr releases used index=
-            self.sdr = RtlSdr(index=index)
+            with self._dev_lock:
+                self.sdr = RtlSdr(index=index)
         self._open = True
 
     # -- identity ----------------------------------------------------------
@@ -254,12 +283,15 @@ class RtlSdrDevice:
             return "RTL2832U"
 
     # -- configuration -----------------------------------------------------
+    @_devlocked
     def set_center_freq(self, freq_hz):
         self.sdr.center_freq = freq_hz
 
+    @_devlocked
     def set_sample_rate(self, rate):
         self.sdr.sample_rate = rate
 
+    @_devlocked
     def set_gain(self, gain_db=None):
         """gain_db=None -> hardware AGC; else a value from get_gains()."""
         if gain_db is None:
@@ -267,12 +299,14 @@ class RtlSdrDevice:
         else:
             self.sdr.gain = float(gain_db)
 
+    @_devlocked
     def get_gains(self):
         try:
             return [round(g / 10.0, 1) for g in self.sdr.get_gains()]
         except Exception:
             return []
 
+    @_devlocked
     def set_direct_sampling(self, mode):
         """mode: 'disabled' | 'i' | 'q'  ('q' is used for AM / HF on the v3)
 
@@ -303,6 +337,7 @@ class RtlSdrDevice:
         raise OSError("set_direct_sampling(%r) rejected by pyrtlsdr/librtlsdr"
                       % (mode,))
 
+    @_devlocked
     def set_bias_tee(self, on):
         try:
             self.sdr.set_bias_tee(bool(on))
@@ -310,10 +345,12 @@ class RtlSdrDevice:
             pass  # older librtlsdr builds lack rtlsdr_set_bias_tee
 
     # -- streaming ---------------------------------------------------------
+    @_devlocked
     def read_iq(self, num_samples):
         """Returns complex64 IQ block normalized to roughly [-1, 1]."""
         return self.sdr.read_samples(num_samples)
 
+    @_devlocked
     def close(self):
         if self._open:
             try:
