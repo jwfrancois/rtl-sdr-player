@@ -197,6 +197,18 @@ function applyStatus(st) {
   }
   $("stat-note").textContent = st.error ? ("⚠ " + st.error) :
     (st.note || "");
+
+  // v1.7.2: dongle diagnostics banner — when the app is on the simulator
+  // and the Linux USB probe has a verdict, show it with the exact fix
+  const hint = $("device-hint");
+  if (st.mode !== "hardware" && st.usb_probe && st.usb_probe.hint) {
+    const healthy = st.usb_probe.hint.indexOf("looks healthy") >= 0;
+    hint.innerHTML = "<b>" + (healthy ? "Dongle check: "
+      : "Dongle not usable: ") + "</b>" + st.usb_probe.hint;
+    hint.hidden = false;
+  } else {
+    hint.hidden = true;
+  }
   $("band-desc").textContent = (st.bands?.[S.band]?.desc) || "";
   const deemph = st.de_emphasis_us || 75;
   const region = st.region || "US";

@@ -32,7 +32,7 @@ RUN python3 -m venv /opt/venv \
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Application
-COPY app.py check_dlls.py config.json run.sh README.md ./
+COPY app.py check_dlls.py config.json run.sh linux-setup.sh README.md ./
 COPY backend ./backend
 COPY web ./web
 COPY dlls ./dlls

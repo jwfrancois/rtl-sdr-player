@@ -360,6 +360,14 @@ async def main():
     st = rest("/api/status")
     check("app alive in sim after failed switch",
           st.get("mode") == "sim", str(st.get("mode")))
+    # v1.7.2: dongle diagnostics ride along in /api/status (Linux only)
+    if sys.platform.startswith("linux"):
+        probe = st.get("usb_probe") or {}
+        check("usb_probe present on linux",
+              probe.get("os") == "linux" and isinstance(probe.get("hint"), str),
+              (probe.get("hint") or "")[:50])
+    else:
+        check("usb_probe absent off-linux", st.get("usb_probe") is None)
     try:
         rest("/api/device/mode", {"mode": "banana"})
         check("invalid mode rejected", False)

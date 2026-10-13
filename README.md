@@ -96,8 +96,33 @@ pip install -r requirements.txt
 python3 app.py
 ```
 
+Or let the shipped script do everything (libusb, DVB-driver blacklist,
+udev rules, module unload):
+
+```bash
+sudo bash linux-setup.sh
+```
+
 macOS: `brew install librtlsdr`, then `pip install -r requirements.txt`
 (radio works; TV does not).
+
+### "The player does not see my dongle" (Linux)
+
+Since v1.7.2 the web UI shows a **dongle diagnostics banner** the moment
+the app falls back to the simulator — the banner states exactly which of
+the four usual causes applies and the command that fixes it. The classic
+line-up, in the order the probe checks them:
+
+| Banner verdict | Meaning | Fix |
+|---|---|---|
+| *No RTL2832U found on the USB bus* | cable / port / power issue | replug, try another port, check `lsusb` for `0bda:2838` |
+| *the DVB TV kernel driver has claimed it* | `dvb_usb_rtl28xxu` grabbed the stick (the #1 cause on Ubuntu) | `sudo modprobe -r dvb_usb_rtl28xxu` now + `sudo bash linux-setup.sh` to make it permanent (works for Docker too — the blacklist lives on the **host**) |
+| *device node is not visible* | Docker without USB passthrough, or a missing `/dev/bus/usb` node | `--device=/dev/bus/usb` on `docker run` (docker-compose.yml already has it), replug on a bare host |
+| *no read/write access* | udev permissions | `sudo bash linux-setup.sh` (installs rules for `0bda:2832/2838`), then replug |
+| *USB side looks healthy* | something else | another SDR program may hold the stick, or librtlsdr failed to load — see the error line under the header |
+
+The same probe backs the API (`GET /api/status` → `usb_probe`), so you can
+check from the shell: `curl -s localhost:8515/api/status | python3 -m json.tool | grep -A6 usb_probe`.
 
 ---
 
@@ -109,9 +134,7 @@ headless on a server with the dongle plugged in:
 ```bash
 # one-time host prep
 curl -fsSL https://get.docker.com | sudo sh        # or: sudo apt install docker.io docker-compose-v2
-sudo modprobe -r dvb_usb_rtl28xxu                  # free the stick for SDR mode
-echo 'blacklist dvb_usb_rtl28xxu' | \
-  sudo tee /etc/modprobe.d/blacklist-rtl28xxu.conf # survive reboots
+sudo bash linux-setup.sh                           # DVB blacklist + udev rules (host side)
 
 # build + run
 git clone https://github.com/jwfrancois/rtl-sdr-player.git

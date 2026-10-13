@@ -44,6 +44,21 @@ body { display: flex; flex-direction: column; min-height: 100vh; }
 #offline-banner strong { color: var(--text); }
 #offline-banner .off-host { font-family: var(--mono); color: var(--text); }
 
+/* v1.7.2: dongle diagnostics banner (shown when the app fell back to the
+   simulator and the USB probe has something to say) */
+#device-hint {
+  margin: 10px 18px 0;
+  padding: 10px 14px;
+  border: 1px solid rgba(251, 191, 36, .45);
+  border-radius: 8px;
+  background: rgba(251, 191, 36, .07);
+  color: var(--amber);
+  font-size: 13.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+#device-hint b { color: var(--text); }
+
 /* ---------- top bar ---------- */
 .topbar {
   display: flex; align-items: center; justify-content: space-between;

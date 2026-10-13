@@ -39,6 +39,9 @@ jobs:
       - name: Engine test (demods, squelch, scanner, SSB, memory)
         run: python tests/test_engine.py
 
+      - name: Linux USB probe test (dongle diagnostics)
+        run: python tests/test_device_probe.py
+
       - name: Digest unit tests (journal, builder, schedule, SMTP)
         run: python tests/test_digest.py
 

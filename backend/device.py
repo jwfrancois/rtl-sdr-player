@@ -19,6 +19,163 @@ import numpy as np
 from . import rds as rds_mod
 
 IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX = platform.system() == "Linux"
+
+# --------------------------------------------------------------------------
+# Linux USB probe (v1.7.2): "the player does not see my dongle" on Ubuntu
+#
+# Four causes cover essentially every case, in this order:
+#   1. the dongle is not actually on the bus (cable/port/power)
+#   2. the DVB TV kernel driver (dvb_usb_rtl28xxu) claimed it first
+#   3. the /dev/bus/usb node is not exposed to this process (Docker without
+#      --device=/dev/bus/usb, or a restrictive udev setup)
+#   4. the user has no read/write permission on the node (udev rules)
+#
+# The probe reads sysfs directly — no lsusb / udevadm / sudo needed — and
+# works both on a bare host and inside a container (sysfs is shared with
+# the host, so driver claims and device presence are visible either way).
+# --------------------------------------------------------------------------
+RTL_USB_VID = "0bda"
+RTL_USB_PIDS = {"2832", "2838"}     # RTL2832U / RTL2838UHIDIR (v3 sticks)
+DVB_CLAIM_DRIVERS = {"dvb_usb_rtl28xxu", "dvb_usb_rtl2832u"}
+
+
+def _sysfs_read(path):
+    """Small text file from sysfs -> stripped string, or None. Never raises."""
+    try:
+        with open(path, "r") as fh:
+            return fh.read().strip().lower()
+    except OSError:
+        return None
+
+
+def probe_linux_usb(sys_root="/sys/bus/usb/devices", mod_root="/sys/module",
+                    dev_root="/dev/bus/usb"):
+    """Best-effort host USB probe for an RTL2832U dongle (Linux only).
+
+    Returns a dict with structured findings plus a single human-readable
+    `hint` describing what (if anything) is wrong and the exact fix.
+    Designed to be embedded in /api/status so the browser can show it.
+    Never raises. The paths are parameters so tests can feed a fake tree.
+    """
+    rep = {"os": "linux", "present": False, "devices": [],
+           "driver_bound": None, "dvb_module_loaded": False,
+           "devnode": None, "devnode_ok": None, "hint": None}
+    if not IS_LINUX and not os.path.isdir(sys_root):
+        rep["os"] = platform.system().lower()
+        return rep
+    try:
+        for entry in sorted(os.listdir(sys_root)):
+            full = os.path.join(sys_root, entry)
+            if not os.path.isdir(full):
+                continue
+            vid = _sysfs_read(os.path.join(full, "idVendor"))
+            if vid != RTL_USB_VID:
+                continue
+            pid = _sysfs_read(os.path.join(full, "idProduct"))
+            if pid in RTL_USB_PIDS:
+                rep["devices"].append({"sysfs": entry, "vid": vid,
+                                       "pid": pid})
+    except OSError:
+        # sysfs unavailable (restricted container / exotic kernel): say so
+        # instead of staying silent — the UI banner needs a verdict
+        rep["hint"] = ("USB probe unavailable (no sysfs in this environment): "
+                       "the USB bus cannot be checked from here. On a normal "
+                       "Ubuntu host this never happens.")
+        return rep
+    rep["present"] = bool(rep["devices"])
+
+    if not rep["present"]:
+        rep["hint"] = (
+            "No RTL2832U dongle found on the USB bus. Replug the stick, try "
+            "another port or cable, and check `lsusb` for a Realtek entry "
+            "(0bda:2832 / 0bda:2838). On a server, avoid unpowered hubs.")
+        return rep
+
+    dev0 = rep["devices"][0]["sysfs"]   # first match, e.g. "3-2"
+
+    # 1) DVB TV driver bound to one of its interfaces ("3-2:1.0")
+    try:
+        for ifdir in sorted(os.listdir(sys_root)):
+            if not ifdir.startswith(dev0 + ":"):
+                continue
+            drv = os.path.join(sys_root, ifdir, "driver")
+            if os.path.islink(drv):
+                rep["driver_bound"] = os.path.basename(os.readlink(drv))
+                break
+    except OSError:
+        pass
+    rep["dvb_module_loaded"] = os.path.isdir(
+        os.path.join(mod_root, "dvb_usb_rtl28xxu"))
+    if rep["driver_bound"] in DVB_CLAIM_DRIVERS:
+        rep["hint"] = (
+            "The dongle is on the bus, but the DVB TV kernel driver "
+            "(dvb_usb_rtl28xxu) has claimed it - the #1 cause on Ubuntu. "
+            "Free it now: sudo modprobe -r dvb_usb_rtl28xxu rtl2832 r820t "
+            "and make it permanent with: sudo bash linux-setup.sh "
+            "(blacklist + udev rules). Works the same for Docker: the "
+            "blacklist belongs on the HOST.")
+        return rep
+    if rep["dvb_module_loaded"] and rep["driver_bound"] is None:
+        rep["hint"] = (
+            "The DVB TV kernel module (dvb_usb_rtl28xxu) is loaded and will "
+            "claim the dongle at the next replug. Make it permanent: "
+            "sudo bash linux-setup.sh (blacklist + udev rules), or right "
+            "now: sudo modprobe -r dvb_usb_rtl28xxu")
+        return rep
+
+    # 2) device node visible?
+    def _node_num(v):
+        try:
+            return "%03d" % int(str(v), 0)   # decimal (sysfs) or 0x-prefixed
+        except ValueError:
+            return None
+
+    busnum = _sysfs_read(os.path.join(sys_root, dev0, "busnum"))
+    devnum = _sysfs_read(os.path.join(sys_root, dev0, "devnum"))
+    node = None
+    b, d = _node_num(busnum), _node_num(devnum)
+    if b and d:
+        node = os.path.join(dev_root, b, d)
+    rep["devnode"] = node
+    if node is None or not os.path.exists(node):
+        rep["devnode_ok"] = False
+        rep["hint"] = (
+            "Dongle IS on the USB bus, but its /dev/bus/usb device node is "
+            "not visible to this process. Under Docker, pass the bus "
+            "through: --device=/dev/bus/usb (docker-compose.yml already "
+            "does). On a bare host, replug the stick or check that udev "
+            "created the node.")
+        return rep
+
+    # 3) read/write permission on the node?
+    ok = os.access(node, os.R_OK | os.W_OK)
+    rep["devnode_ok"] = ok
+    if not ok:
+        rep["hint"] = (
+            "Dongle present, but this user has no read/write access to "
+            + node + ". Install udev rules: sudo bash linux-setup.sh "
+            "(or add your user to the plugdev group and log out/in).")
+        return rep
+
+    rep["hint"] = (
+        "USB side looks healthy: dongle present, no DVB driver bound, "
+        "device node accessible. If the player still cannot open it, "
+        "another SDR program may be holding the stick, or librtlsdr failed "
+        "to load - see the error text below the header.")
+    return rep
+
+
+_probe_cache = {"t": 0.0, "rep": None}
+
+
+def probe_linux_usb_cached(ttl=10.0):
+    """Cached probe for /api/status (polled every few seconds)."""
+    now = time.monotonic()
+    if _probe_cache["rep"] is None or now - _probe_cache["t"] > ttl:
+        _probe_cache["rep"] = probe_linux_usb()
+        _probe_cache["t"] = now
+    return _probe_cache["rep"]
 
 # --------------------------------------------------------------------------
 # Windows DLL discovery (THE fix for "DLLs are in the folder but not found")
@@ -545,6 +702,15 @@ def open_device(prefer_sim=False):
 
 def _usb_error_hint(exc):
     msg = str(exc)
+    if not IS_WINDOWS:
+        # Linux: the sysfs probe knows far more than the exception string.
+        probe = probe_linux_usb()
+        if probe.get("hint"):
+            if "looks healthy" not in probe["hint"]:
+                return probe["hint"]
+            return (
+                "Could not open the RTL2832U: %s. %s"
+                % (msg, probe["hint"]))
     if IS_WINDOWS and ("libusb" in msg.lower() or "open" in msg.lower()
                        or "access" in msg.lower() or "device" in msg.lower()):
         return (

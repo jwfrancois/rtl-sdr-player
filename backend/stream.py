@@ -1409,6 +1409,12 @@ class ReceiverEngine:
                 "backend": self.info.get("backend"),
                 "note": self.info.get("note"),
                 "error": self.info.get("error"),
+                # v1.7.2: Linux USB diagnostics when the dongle is not in
+                # use (sim fallback / not yet opened) - the browser shows
+                # the hint in a banner. None in hardware mode.
+                "usb_probe": (devmod.probe_linux_usb_cached()
+                              if (self.info.get("mode") != "hardware"
+                                  and devmod.IS_LINUX) else None),
                 "band": self.band,
                 "freq_hz": self.freq,
                 "gain_db": self.gain_db,
