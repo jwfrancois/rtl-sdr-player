@@ -366,6 +366,53 @@ def _register_windows_dll_dirs():
 _DLL_DIR_HANDLES = _register_windows_dll_dirs()
 
 
+def _mapped_paths(needle):
+    """Sorted paths of mapped shared objects whose map line has `needle`.
+
+    Reads /proc/self/maps - the ground truth about what this process has
+    actually mapped, independent of any loader bookkeeping. Empty list
+    where /proc is unavailable (Windows). Never raises.
+    """
+    out = set()
+    try:
+        with open("/proc/self/maps", "r") as fh:
+            for line in fh:
+                if needle in line:
+                    parts = line.split()
+                    if len(parts) >= 6:
+                        out.add(parts[-1])
+    except OSError:
+        pass
+    return sorted(out)
+
+
+def _native_lib_identity():
+    """Identify the live native librtlsdr (+ mapped libusb) - (str, list).
+
+    pyrtlsdr 0.5.x rebinds the loaded CDLL over its own `librtlsdr`
+    submodule INSIDE the package namespace, so `from rtlsdr import
+    librtlsdr` yields the CDLL, not the module - and getattr() on a
+    CDLL silently resolves C symbols (AttributeError -> default), which
+    is exactly what made v1.7.7 print 'unknown'. Go through sys.modules
+    instead; fall back to /proc/self/maps, which cannot lie. Never
+    raises.
+    """
+    path = None
+    try:
+        import importlib
+        importlib.import_module("rtlsdr.librtlsdr")
+        sub = sys.modules.get("rtlsdr.librtlsdr")
+        if sub is not None:
+            path = getattr(sub.librtlsdr, "_name", None)
+    except Exception:
+        path = None
+    if not path:
+        mapped = _mapped_paths("librtlsdr")
+        path = mapped[0] if mapped else None
+    usb = _mapped_paths("libusb-1.0") or _mapped_paths("libusb")
+    return (path or "unknown"), usb
+
+
 # --------------------------------------------------------------------------
 # Real hardware
 # --------------------------------------------------------------------------
@@ -375,16 +422,7 @@ class RtlSdrDevice:
     def __init__(self, index=0):
         from rtlsdr import RtlSdr  # deferred import: gives friendly errors upstream
 
-        # v1.7.7: announce the exact native librtlsdr binary BEFORE it is
-        # exercised - on a crashed headless box the console is all you have
-        try:
-            from rtlsdr import librtlsdr as _libmod
-            _libpath = (getattr(_libmod.librtlsdr, "_name", None)
-                        or "unknown")
-        except Exception:
-            _libpath = "unknown"
-        print("librtlsdr : opening dongle on index %s (native lib: %s)"
-              % (index, _libpath))
+        print("librtlsdr : opening dongle on index %s" % index)
 
         self._dev_lock = threading.RLock()   # guards every librtlsdr call
         self.index = index
@@ -397,8 +435,13 @@ class RtlSdrDevice:
             with self._dev_lock:
                 self.sdr = RtlSdr(index=index)
         self._open = True
-        # v1.7.5 diagnostics: record which native librtlsdr binary is live
-        self.librtlsdr = _libpath
+        # v1.7.5/1.7.8 diagnostics: identify the native librtlsdr that is
+        # NOW live (loader report, /proc/self/maps fallback) and announce
+        # it - on a crashed headless box the console is all you have
+        self.librtlsdr, _usb = _native_lib_identity()
+        print("librtlsdr : dongle opened (native lib: %s)" % self.librtlsdr)
+        for _u in _usb:
+            print("            usb: %s" % _u)
 
     # -- identity ----------------------------------------------------------
     @property

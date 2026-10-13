@@ -178,7 +178,9 @@ shows it too — it should be a system path like
 `.../site-packages/pyrtlsdrlib/...` path. Since v1.7.7 a missing system
 library is loud, not silent: if the player would fall back to the
 crash-prone bundled build, the console prints a WARNING with the fix, and
-every dongle open announces the native library path it is about to use.
+every dongle open announces the native library it is actually using
+(identified via the loader and the process memory map, v1.7.8 — the
+`usb:` line shows which libusb the native library is really bound to).
 `rtl_test` (from the `rtl-sdr`
 package) is a handy independent check that the distro library and dongle
 cooperate. Escape hatch if you ever need the wheel's build back:

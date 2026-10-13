@@ -6,6 +6,7 @@ probe_linux_usb() through every diagnostic branch:
   devnode missing (Docker passthrough) / devnode not writable (udev) /
   everything healthy / non-RTL devices ignored.
 """
+import importlib
 import os
 import shutil
 import sys
@@ -282,6 +283,31 @@ def main():
             sys.modules.pop("pyrtlsdrlib", None)
         else:
             sys.modules["pyrtlsdrlib"] = saved
+
+    # -- v1.7.8: native library identity (sys.modules + /proc/self/maps) ----
+    lst = devmod._mapped_paths("definitely-not-mapped-anywhere-xyz")
+    check("_mapped_paths returns [] for absent needle", lst == [])
+    lst2 = devmod._mapped_paths("python")
+    check("_mapped_paths finds mapped objects",
+          isinstance(lst2, list) and len(lst2) > 0
+          and all(p.endswith(".so") or "/" in p for p in lst2),
+          str(lst2[:1]))
+    ident_path, ident_usb = devmod._native_lib_identity()
+    check("_native_lib_identity never raises, str+list",
+          isinstance(ident_path, str) and isinstance(ident_usb, list),
+          ident_path)
+    if sys.platform.startswith("linux"):
+        # with pyrtlsdr importable, the identity must be a real .so path
+        # (bundled wheel here), never the old 'unknown' regression
+        try:
+            importlib.import_module("rtlsdr")
+            have_rtlsdr = True
+        except Exception:
+            have_rtlsdr = False
+        if have_rtlsdr:
+            check("_native_lib_identity resolves the real native lib",
+                  ident_path.endswith(".so") and ident_path != "unknown",
+                  ident_path)
 
     print()
     if not all(CHECKS):
