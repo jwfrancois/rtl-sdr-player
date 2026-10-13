@@ -66,16 +66,19 @@ def probe_linux_usb(sys_root="/sys/bus/usb/devices", mod_root="/sys/module",
         return rep
     try:
         for entry in sorted(os.listdir(sys_root)):
-            full = os.path.join(sys_root, entry)
-            if not os.path.isdir(full):
-                continue
-            vid = _sysfs_read(os.path.join(full, "idVendor"))
-            if vid != RTL_USB_VID:
-                continue
-            pid = _sysfs_read(os.path.join(full, "idProduct"))
-            if pid in RTL_USB_PIDS:
-                rep["devices"].append({"sysfs": entry, "vid": vid,
-                                       "pid": pid})
+            try:
+                full = os.path.join(sys_root, entry)
+                if not os.path.isdir(full):
+                    continue
+                vid = _sysfs_read(os.path.join(full, "idVendor"))
+                if vid != RTL_USB_VID:
+                    continue
+                pid = _sysfs_read(os.path.join(full, "idProduct"))
+                if pid in RTL_USB_PIDS:
+                    rep["devices"].append({"sysfs": entry, "vid": vid,
+                                           "pid": pid})
+            except OSError:
+                continue          # one odd entry must not kill the probe
     except OSError:
         # sysfs unavailable (restricted container / exotic kernel): say so
         # instead of staying silent — the UI banner needs a verdict

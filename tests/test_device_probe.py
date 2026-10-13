@@ -55,13 +55,15 @@ def make_tree(fx, vid="0bda", pid="2838", bound_driver=None,
         f.write("046d\n")
     with open(os.path.join(other, "idProduct"), "w") as f:
         f.write("c52b\n")
-    # interface dir (with optional DVB driver symlink)
+    # interface dir (with optional DVB driver symlink). A colon is legal in
+    # Linux sysfs names but NOT in Windows directory names - skip there.
     ifd = os.path.join(sysd, "3-2:1.0")
-    os.makedirs(ifd)
-    if bound_driver and symlinks_ok():
-        drvdir = os.path.join(fx, "drivers", bound_driver)
-        os.makedirs(drvdir)
-        os.symlink(drvdir, os.path.join(ifd, "driver"))
+    if os.name == "posix":
+        os.makedirs(ifd)
+        if bound_driver and symlinks_ok():
+            drvdir = os.path.join(fx, "drivers", bound_driver)
+            os.makedirs(drvdir)
+            os.symlink(drvdir, os.path.join(ifd, "driver"))
     if dvb_module:
         os.makedirs(os.path.join(mods, "dvb_usb_rtl28xxu"))
     if devnode:
