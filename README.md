@@ -175,7 +175,11 @@ The console prints the exact binary in use, and
 `curl -s localhost:8515/api/status | python3 -m json.tool | grep librtlsdr`
 shows it too — it should be a system path like
 `/usr/lib/x86_64-linux-gnu/librtlsdr.so.0`, never a
-`.../site-packages/pyrtlsdrlib/...` path. `rtl_test` (from the `rtl-sdr`
+`.../site-packages/pyrtlsdrlib/...` path. Since v1.7.7 a missing system
+library is loud, not silent: if the player would fall back to the
+crash-prone bundled build, the console prints a WARNING with the fix, and
+every dongle open announces the native library path it is about to use.
+`rtl_test` (from the `rtl-sdr`
 package) is a handy independent check that the distro library and dongle
 cooperate. Escape hatch if you ever need the wheel's build back:
 `RTLSDR_PLAYER_FORCE_BUNDLED=1 bash run.sh`.

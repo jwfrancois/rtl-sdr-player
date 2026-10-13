@@ -119,6 +119,18 @@ def prefer_system_librtlsdr(platform_name=None, force_bundled=None):
         print("            (pyrtlsdrlib wheel build disabled - it can segfault")
         print("            in rtlsdr_read_sync on modern kernels;")
         print("            RTLSDR_PLAYER_FORCE_BUNDLED=1 overrides this)")
+    else:
+        # v1.7.7: the crash-prone bundled fallback must not be silent -
+        # this exact fallback looks identical to the pre-v1.7.5 segfault
+        print("librtlsdr : WARNING - no system librtlsdr found; the")
+        print("            pyrtlsdrlib wheel's bundled build will be used. It")
+        print("            carries its own old libusb and is known to segfault")
+        print("            in rtlsdr_read_sync on modern kernels (observed on")
+        print("            Ubuntu 24.04 within seconds of opening the dongle).")
+        print("            fix    : sudo apt install librtlsdr0 rtl-sdr")
+        print("            ubuntu : the package lives in the 'universe' repo -")
+        print("                     sudo add-apt-repository universe && sudo apt update")
+        print("            or simply: sudo bash linux-setup.sh")
     return report
 
 
@@ -363,6 +375,17 @@ class RtlSdrDevice:
     def __init__(self, index=0):
         from rtlsdr import RtlSdr  # deferred import: gives friendly errors upstream
 
+        # v1.7.7: announce the exact native librtlsdr binary BEFORE it is
+        # exercised - on a crashed headless box the console is all you have
+        try:
+            from rtlsdr import librtlsdr as _libmod
+            _libpath = (getattr(_libmod.librtlsdr, "_name", None)
+                        or "unknown")
+        except Exception:
+            _libpath = "unknown"
+        print("librtlsdr : opening dongle on index %s (native lib: %s)"
+              % (index, _libpath))
+
         self._dev_lock = threading.RLock()   # guards every librtlsdr call
         self.index = index
         try:
@@ -375,12 +398,7 @@ class RtlSdrDevice:
                 self.sdr = RtlSdr(index=index)
         self._open = True
         # v1.7.5 diagnostics: record which native librtlsdr binary is live
-        try:
-            from rtlsdr import librtlsdr as _libmod
-            self.librtlsdr = (getattr(_libmod.librtlsdr, "_name", None)
-                              or "unknown")
-        except Exception:
-            self.librtlsdr = "unknown"
+        self.librtlsdr = _libpath
 
     # -- identity ----------------------------------------------------------
     @property
