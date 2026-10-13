@@ -7,6 +7,8 @@ Provides a uniform interface over:
 open_device() performs detection and never raises: it returns
 (device, info) where info describes what was opened, or why it failed.
 """
+import ctypes.util
+import glob
 import math
 import os
 import platform
@@ -22,6 +24,105 @@ from . import rds as rds_mod
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
+
+
+# --------------------------------------------------------------------------
+# Native library preference (v1.7.5): on Linux, use the distro's librtlsdr
+#
+# pyrtlsdr's loader tries the pyrtlsdrlib wheel's bundled librtlsdr FIRST
+# and never reaches the system copy while the wheel imports. That bundled
+# build is a 0.8git snapshot carrying its own private, ancient libusb and
+# libudev; on modern kernels (Ubuntu 24.04) it segfaults inside
+# rtlsdr_read_sync within seconds of opening the dongle (observed: tuner
+# detected -> "Disabled direct sampling mode" -> Segmentation fault), while
+# the distro build - compiled against the system libusb - is what every
+# Linux SDR tool uses. If a distro librtlsdr is present we make
+# `import pyrtlsdrlib` fail, so pyrtlsdr falls through to the system
+# library. Set RTLSDR_PLAYER_FORCE_BUNDLED=1 to keep the wheel's build.
+# --------------------------------------------------------------------------
+def _librtlsdr_abi_ok(path):
+    """True if the shared object exposes the librtlsdr 0.x API pyrtlsdr needs.
+
+    pyrtlsdr binds rtlsdr_set_dithering and friends at import time; librtlsdr
+    2.x (Debian 13+) removed those symbols, so loading it would crash the
+    import. Such a lib must be rejected and the bundled wheel kept.
+    Never raises.
+    """
+    try:
+        lib = ctypes.CDLL(path)
+        for sym in ("rtlsdr_open", "rtlsdr_read_sync", "rtlsdr_set_dithering"):
+            if not hasattr(lib, sym):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def find_system_librtlsdr(search_dirs=None, validate=None):
+    """Return a distro librtlsdr pyrtlsdr can actually use, or None.
+
+    Candidates come from ctypes.util.find_library plus a scan of the usual
+    multiarch locations on Debian/Ubuntu; each candidate must pass
+    `validate` (default: the 0.x ABI check). `search_dirs`/`validate` are
+    injectable for tests. Never raises.
+    """
+    candidates = []
+    try:
+        found = ctypes.util.find_library("rtlsdr")
+        if found:
+            candidates.append(found)
+    except Exception:
+        pass
+    if search_dirs is None:
+        search_dirs = ["/usr/lib", "/usr/local/lib", "/lib", "/usr/lib64"]
+        search_dirs += ["/usr/lib/%s-linux-gnu" % m for m in
+                        ("x86_64", "aarch64", "arm", "i386", "riscv64")]
+    for d in search_dirs:
+        try:
+            candidates.extend(
+                sorted(glob.glob(os.path.join(d, "librtlsdr.so.*"))))
+        except Exception:
+            continue
+    if validate is None:
+        validate = _librtlsdr_abi_ok
+    for cand in candidates:
+        try:
+            if validate(cand):
+                return cand
+        except Exception:
+            continue
+    return None
+
+
+def prefer_system_librtlsdr(platform_name=None, force_bundled=None):
+    """Disable the pyrtlsdrlib wheel when a distro librtlsdr exists (Linux).
+
+    Runs once at import time, before anything imports rtlsdr. Returns a
+    small report dict for diagnostics and tests. Windows/macOS: no-op
+    (the Windows DLL situation is handled by setup.bat / check_dlls.py).
+    """
+    report = {"system": None, "bundled_disabled": False}
+    if force_bundled is None:
+        force_bundled = bool(os.environ.get("RTLSDR_PLAYER_FORCE_BUNDLED"))
+    if force_bundled:
+        return report
+    if not (platform_name or sys.platform).startswith("linux"):
+        return report
+    path = find_system_librtlsdr()
+    report["system"] = path
+    if path:
+        # next `import pyrtlsdrlib` raises ImportError -> pyrtlsdr's loader
+        # falls through to LD_LIBRARY_PATH / find_library (the distro lib)
+        sys.modules["pyrtlsdrlib"] = None
+        report["bundled_disabled"] = True
+        print("librtlsdr : using distro library %s" % path)
+        print("            (pyrtlsdrlib wheel build disabled - it can segfault")
+        print("            in rtlsdr_read_sync on modern kernels;")
+        print("            RTLSDR_PLAYER_FORCE_BUNDLED=1 overrides this)")
+    return report
+
+
+prefer_system_librtlsdr()   # v1.7.5: before anything imports rtlsdr
 
 
 # --------------------------------------------------------------------------
@@ -273,6 +374,13 @@ class RtlSdrDevice:
             with self._dev_lock:
                 self.sdr = RtlSdr(index=index)
         self._open = True
+        # v1.7.5 diagnostics: record which native librtlsdr binary is live
+        try:
+            from rtlsdr import librtlsdr as _libmod
+            self.librtlsdr = (getattr(_libmod.librtlsdr, "_name", None)
+                              or "unknown")
+        except Exception:
+            self.librtlsdr = "unknown"
 
     # -- identity ----------------------------------------------------------
     @property
@@ -648,7 +756,7 @@ def _import_error_hint():
     if not IS_WINDOWS:
         return (
             "pyrtlsdr is installed but librtlsdr was not found. "
-            "Install it with your package manager, e.g. sudo apt install librtlsdr-dev rtl-sdr"
+            "Install it with your package manager, e.g. sudo apt install librtlsdr0 rtl-sdr"
         )
 
     rep = windows_dll_report()
@@ -722,6 +830,7 @@ def open_device(prefer_sim=False):
                     "mode": "hardware",
                     "device": dev.name,
                     "backend": "pyrtlsdr / librtlsdr",
+                    "librtlsdr": getattr(dev, "librtlsdr", "unknown"),
                     "note": "RTL2832U detected and streaming.",
                 }
                 return dev, info

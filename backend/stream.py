@@ -1407,6 +1407,7 @@ class ReceiverEngine:
                 "bfo_hz": self.bfo_hz,
                 "device": self.info.get("device"),
                 "backend": self.info.get("backend"),
+                "librtlsdr": self.info.get("librtlsdr"),
                 "note": self.info.get("note"),
                 "error": self.info.get("error"),
                 # v1.7.2: Linux USB diagnostics when the dongle is not in

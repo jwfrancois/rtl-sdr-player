@@ -234,6 +234,55 @@ def main():
         check("lock is reentrant (nested same-thread call)", False, str(exc))
     check("read_iq still returns the block", len(dev.read_iq(64)) == 64)
 
+    # ---- v1.7.5: prefer the distro librtlsdr over the wheel's bundled one --
+    # find_system_librtlsdr() must locate a distro .so in a given dir and
+    # return None when there is none or when the candidate fails the ABI
+    # check; prefer_system_librtlsdr() must neutralize pyrtlsdrlib only on
+    # Linux and honor the escape hatch.
+    d = tempfile.mkdtemp()
+    fake = os.path.join(d, "librtlsdr.so.0")
+    open(fake, "w").close()
+    ok = lambda p: True          # fake files: pretend the ABI is fine
+    hit = devmod.find_system_librtlsdr(search_dirs=[d], validate=ok)
+    check("find_system_librtlsdr finds a distro lib in a given dir",
+          hit == fake, str(hit))
+    hit2 = devmod.find_system_librtlsdr(
+        search_dirs=[os.path.join(d, "nope")], validate=ok)
+    check("find_system_librtlsdr returns None when nothing matches",
+          hit2 is None)
+    other = os.path.join(d, "librtlsdr.so.0.6.0")
+    open(other, "w").close()
+    hit3 = devmod.find_system_librtlsdr(search_dirs=[d], validate=ok)
+    check("multiple candidates -> deterministic pick",
+          hit3 in (fake, other), str(hit3))
+    hit4 = devmod.find_system_librtlsdr(search_dirs=[d], validate=lambda p: False)
+    check("candidate failing the ABI check is rejected", hit4 is None)
+    hit5 = devmod.find_system_librtlsdr(search_dirs=[d])
+    check("real ABI validation rejects fake text files", hit5 is None)
+
+    saved = sys.modules.get("pyrtlsdrlib", "absent")
+    orig_finder = devmod.find_system_librtlsdr
+    try:
+        devmod.find_system_librtlsdr = lambda search_dirs=None: fake
+        rep = devmod.prefer_system_librtlsdr(platform_name="linux",
+                                             force_bundled=True)
+        check("RTLSDR_PLAYER_FORCE_BUNDLED escape hatch keeps the wheel",
+              rep["bundled_disabled"] is False)
+        rep2 = devmod.prefer_system_librtlsdr(platform_name="linux")
+        check("linux + distro lib -> bundled wheel disabled",
+              rep2["bundled_disabled"] is True
+              and sys.modules.get("pyrtlsdrlib") is None)
+        rep3 = devmod.prefer_system_librtlsdr(platform_name="win32")
+        check("windows -> no-op (bundled dll logic untouched)",
+              rep3["bundled_disabled"] is False
+              and rep3["system"] is None)
+    finally:
+        devmod.find_system_librtlsdr = orig_finder
+        if saved == "absent":
+            sys.modules.pop("pyrtlsdrlib", None)
+        else:
+            sys.modules["pyrtlsdrlib"] = saved
+
     print()
     if not all(CHECKS):
         print("DEVICE PROBE TEST: FAIL (%d/%d)"

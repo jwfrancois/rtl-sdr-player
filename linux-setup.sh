@@ -23,17 +23,27 @@ fi
 
 echo "== RTL-SDR Player: Linux host setup =="
 
-# --- 1. libusb -------------------------------------------------------------
+# --- 1. native libraries ----------------------------------------------------
 if command -v apt-get >/dev/null 2>&1; then
+  apt-get update -qq 2>/dev/null || true
   if ! dpkg -s libusb-1.0-0 >/dev/null 2>&1; then
     echo "-- installing libusb-1.0-0"
-    apt-get update -qq && apt-get install -y -qq libusb-1.0-0 || \
+    apt-get install -y -qq libusb-1.0-0 || \
       echo "   (could not install libusb automatically - install it manually)"
   else
     echo "-- libusb-1.0-0 already installed"
   fi
+  # v1.7.5: the player prefers the DISTRO librtlsdr over the Python wheel's
+  # bundled snapshot (that one can segfault on modern kernels).
+  if dpkg -s librtlsdr0 >/dev/null 2>&1; then
+    echo "-- librtlsdr0 already installed"
+  else
+    echo "-- installing librtlsdr0 + rtl-sdr (distro native library + tools)"
+    apt-get install -y -qq librtlsdr0 rtl-sdr || \
+      echo "   (could not install automatically - run: sudo apt install librtlsdr0 rtl-sdr)"
+  fi
 else
-  echo "-- apt-get not found: make sure libusb-1.0 is installed"
+  echo "-- apt-get not found: make sure libusb-1.0 and librtlsdr are installed"
 fi
 
 # --- 2. keep the DVB TV driver away from the dongle ------------------------

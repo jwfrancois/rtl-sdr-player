@@ -8,9 +8,10 @@
 #              rtl-sdr-player
 # Or use:  docker compose up -d --build
 #
-# The image uses pyrtlsdrlib's bundled librtlsdr; only libusb comes from
-# apt. Pass the whole USB bus through (--device=/dev/bus/usb) so the
-# RTL2832U dongle is visible inside the container. All runtime state
+# The image prefers the distro librtlsdr (v1.7.5); the pyrtlsdrlib wheel's
+# bundled snapshot is the fallback. Pass the whole USB bus through
+# (--device=/dev/bus/usb) so the RTL2832U dongle is visible inside the
+# container. All runtime state
 # (presets, agent/LLM settings, PI cache, digests, audits) lives in
 # /app/data via the RTLSDR_DATA_DIR env var -> one named volume.
 
@@ -20,7 +21,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3 python3-venv libusb-1.0-0 \
+        python3 python3-venv libusb-1.0-0 librtlsdr0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

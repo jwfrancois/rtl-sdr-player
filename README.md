@@ -109,7 +109,7 @@ sudo bash linux-setup.sh
 ```
 
 Manual route, if you prefer to drive everything yourself:
-`sudo apt install librtlsdr-dev rtl-sdr`, `sudo modprobe -r
+`sudo apt install librtlsdr0 rtl-sdr`, `sudo modprobe -r
 dvb_usb_rtl28xxu`, `pip install -r requirements.txt` (in a venv),
 `python3 app.py` — add `--share` to make it reachable from other
 machines.
@@ -145,6 +145,34 @@ line-up, in the order the probe checks them:
 
 The same probe backs the API (`GET /api/status` → `usb_probe`), so you can
 check from the shell: `curl -s localhost:8515/api/status | python3 -m json.tool | grep -A6 usb_probe`.
+
+### "Fatal Python error: Segmentation fault" at startup (Linux)
+
+Fixed in v1.7.5. The console showed the dongle being found
+(`Found Rafael Micro R820T/2 tuner`, `Disabled direct sampling mode`) and
+the process dying with a segfault right after. Cause: pyrtlsdr's loader
+always tries the **librtlsdr snapshot bundled inside the pyrtlsdrlib
+wheel first** — an old build that ships its own ancient libusb/libudev,
+and it crashes inside `rtlsdr_read_sync` on modern kernels (Ubuntu
+24.04). The distro build, compiled against the system libusb, is what
+every Linux SDR tool uses.
+
+Since v1.7.5 the player prefers the distro library automatically; just
+make sure it is installed (once):
+
+```bash
+sudo apt install librtlsdr0 rtl-sdr     # or: sudo bash linux-setup.sh
+bash run.sh
+```
+
+The console prints the exact binary in use, and
+`curl -s localhost:8515/api/status | python3 -m json.tool | grep librtlsdr`
+shows it too — it should be a system path like
+`/usr/lib/x86_64-linux-gnu/librtlsdr.so.0`, never a
+`.../site-packages/pyrtlsdrlib/...` path. `rtl_test` (from the `rtl-sdr`
+package) is a handy independent check that the distro library and dongle
+cooperate. Escape hatch if you ever need the wheel's build back:
+`RTLSDR_PLAYER_FORCE_BUNDLED=1 bash run.sh`.
 
 ---
 
